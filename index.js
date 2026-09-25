@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import axios from 'axios';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -76,6 +77,31 @@ function requireInternal(req, res, next) {
     }
 
     next();
+}
+
+async function autoResumeSessions(manager) {
+    if (!config.PAIR_BACKEND_URL || !config.INTERNAL_API_TOKEN) return;
+
+    try {
+        const res = await axios.get(
+            `${config.PAIR_BACKEND_URL}/internal/sessions/active`,
+            {
+                headers: { 'x-internal-token': config.INTERNAL_API_TOKEN },
+                timeout: 30000
+            }
+        );
+
+        const sessionIds = res.data?.sessionIds || [];
+        console.log(`🔄 Resuming ${sessionIds.length} previously linked session(s)...`);
+
+        for (const sessionId of sessionIds) {
+            manager.start(sessionId).catch(err => {
+                console.error(`[${sessionId}] Auto-resume failed:`, err.message);
+            });
+        }
+    } catch (err) {
+        console.error('Auto-resume sessions fetch failed:', err.message);
+    }
 }
 
 async function start() {
@@ -182,6 +208,8 @@ async function start() {
         );
     });
 
+    await autoResumeSessions(manager);
+
     // Backwards compatibility only.
     // New deployments should NOT set SESSION_ID.
     if (config.SESSION_ID) {
@@ -194,6 +222,11 @@ async function start() {
             });
     }
 }
+
+process.on('SIGTERM', () => {
+    console.log('🛑 Received SIGTERM — shutting down gracefully.');
+    process.exit(0);
+});
 
 start().catch(err => {
     console.error(
