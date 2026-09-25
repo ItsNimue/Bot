@@ -263,14 +263,21 @@ async function downloadWithScraper(url, quality) {
 }
 
 async function downloadQuality(url, quality) {
+    const notes = [];
+
     if (quality.tier === 'ytdlp') {
         try {
-            return await downloadWithYtdlp(url, quality);
+            const buffer = await downloadWithYtdlp(url, quality);
+            console.log(`[VIDEO] Tier1 (ytdlp-nodejs) success for ${quality.height}p`);
+            return { buffer, notes };
         } catch (e) {
-            console.error('ytdlp-nodejs download failed, falling back to scraper tier:', e.message);
+            notes.push(`ytdlp-nodejs: ${e.message}`);
+            console.log('[VIDEO] ytdlp-nodejs download failed, falling back to scraper tier:', e.message);
         }
     }
-    return await downloadWithScraper(url, quality);
+
+    const scraperResult = await downloadWithScraper(url, quality);
+    return { buffer: scraperResult.buffer, notes: [...notes, ...scraperResult.notes] };
 }
 
 // ============================================================
@@ -433,10 +440,14 @@ function attachVideoListener(sock) {
                         );
 
                         let buffer = null;
+                        let debugNotes = [];
                         try {
-                            buffer = await downloadQuality(session.videoUrl, quality);
+                            const result = await downloadQuality(session.videoUrl, quality);
+                            buffer = result.buffer;
+                            debugNotes = result.notes;
                         } catch (e) {
-                            console.error('Video Download Error:', e);
+                            debugNotes.push(`unexpected: ${e.message}`);
+                            console.log('[VIDEO] Download Error:', e.message);
                         }
 
                         if (!buffer) {
@@ -446,7 +457,9 @@ function attachVideoListener(sock) {
                                 {
                                     text:
                                         `❌ *${quality.label} Download කරගැනීමට නොහැකි විය.*\n` +
-                                        `වෙනත් Quality එකක් උත්සාහ කරන්න.\n\n─── *${watermark}* ───`
+                                        `වෙනත් Quality එකක් උත්සාහ කරන්න.\n\n` +
+                                        `🔧 *Debug (temporary):*\n${debugNotes.map(n => `• ${n}`).join('\n') || 'no details captured'}\n\n` +
+                                        `─── *${watermark}* ───`
                                 },
                                 { quoted: sentMsg }
                             );
