@@ -2,403 +2,392 @@ import movieApi from '@sl-code-lords/movie-api';
 
 const { SinhalaSub } = movieApi;
 
-const SESSION_TTL = 10 * 60 * 1000;
-const MAX_RESULTS = 10;
+const MAX_VIDEO_SIZE = 80 * 1000 * 1000;
 
-// One interactive store per WhatsApp socket.
-const socketStores = new WeakMap();
-const activeStores = new Set();
+const sessions = new Map();
+const attachedSockets = new WeakSet();
 
-function getStore(sock) {
-    let store = socketStores.get(sock);
 
-    if (!store) {
-        store = new Map();
-        socketStores.set(sock, store);
-        activeStores.add(store);
-    }
+// ============================================================
+// HELPERS
+// ============================================================
 
-    cleanupStore(store);
-    return store;
-}
-
-function cleanupStore(store) {
-    const now = Date.now();
-
-    for (const [id, session] of store.entries()) {
-        if (
-            !session ||
-            now - session.createdAt > SESSION_TTL
-        ) {
-            store.delete(id);
-        }
-    }
-}
-
-setInterval(() => {
-    for (const store of activeStores) {
-        cleanupStore(store);
-
-        if (store.size === 0) {
-            activeStores.delete(store);
-        }
-    }
-}, 60 * 1000).unref?.();
-
-function getText(msg) {
-    return String(
-        msg?.message?.conversation ||
-        msg?.message?.extendedTextMessage?.text ||
-        ''
-    ).trim();
-}
-
-function getQuotedStanzaId(msg) {
-    return (
-        msg?.message?.extendedTextMessage?.contextInfo?.stanzaId ||
-        msg?.message?.imageMessage?.contextInfo?.stanzaId ||
-        msg?.message?.videoMessage?.contextInfo?.stanzaId ||
-        null
-    );
-}
-
-function clean(value) {
-    return String(value ?? '')
+function cleanText(value) {
+    return String(value || '')
         .replace(/\s+/g, ' ')
         .trim();
 }
 
-function getTitle(item) {
-    return clean(
+function cleanFileName(name) {
+    return String(name || 'SinhalaSub Movie')
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 180) || 'SinhalaSub Movie';
+}
+
+function normalizeUrl(input) {
+    let url = cleanText(input);
+
+    if (!url) {
+        return null;
+    }
+
+    url = url
+        .replace(/[<>()[\]{}]/g, '')
+        .replace(/[.,!?;]+$/g, '');
+
+    if (!/^https?:\/\//i.test(url)) {
+        url = `https://${url}`;
+    }
+
+    return url;
+}
+
+function isSinhalaSubUrl(value) {
+    try {
+        const url = new URL(normalizeUrl(value));
+
+        const host = url.hostname.toLowerCase();
+
+        return (
+            host === 'sinhalasub.lk' ||
+            host === 'www.sinhalasub.lk'
+        );
+    } catch {
+        return false;
+    }
+}
+
+function parseSizeToBytes(size) {
+    if (
+        size === null ||
+        size === undefined
+    ) {
+        return null;
+    }
+
+    const text = String(size)
+        .trim()
+        .replace(/,/g, '')
+        .toUpperCase();
+
+    if (!text) {
+        return null;
+    }
+
+    const match = text.match(
+        /^([\d.]+)\s*(B|KB|MB|GB|TB)$/
+    );
+
+    if (!match) {
+        return null;
+    }
+
+    const number = Number(match[1]);
+
+    if (!Number.isFinite(number)) {
+        return null;
+    }
+
+    const units = {
+        B: 1,
+        KB: 1000,
+        MB: 1000 ** 2,
+        GB: 1000 ** 3,
+        TB: 1000 ** 4
+    };
+
+    return number * units[match[2]];
+}
+
+function getTextFromMessage(msg) {
+    return cleanText(
+        msg?.message?.conversation ||
+        msg?.message?.extendedTextMessage?.text ||
+        msg?.message?.imageMessage?.caption ||
+        msg?.message?.videoMessage?.caption ||
+        msg?.message?.documentMessage?.caption ||
+        ''
+    );
+}
+
+function getQuotedStanzaId(msg) {
+    return (
+        msg?.message
+            ?.extendedTextMessage
+            ?.contextInfo
+            ?.stanzaId ||
+
+        msg?.message
+            ?.imageMessage
+            ?.contextInfo
+            ?.stanzaId ||
+
+        msg?.message
+            ?.videoMessage
+            ?.contextInfo
+            ?.stanzaId ||
+
+        msg?.message
+            ?.documentMessage
+            ?.contextInfo
+            ?.stanzaId
+    );
+}
+
+function getResultTitle(item) {
+    return (
         item?.title ||
-        item?.name ||
         'Unknown Movie'
     );
 }
 
-function getDownloadLink(item) {
-    return (
-        item?.link ||
-        item?.url ||
-        item?.download ||
-        item?.download_url ||
-        null
-    );
-}
-
-function getQuality(item) {
-    return clean(
-        item?.quality ||
-        item?.resolution ||
-        item?.name ||
-        'Unknown'
-    );
-}
-
-function getSize(item) {
-    return clean(
-        item?.size ||
-        item?.filesize ||
-        'Unknown'
-    );
-}
-
-function isHttpUrl(value) {
-    return /^https?:\/\//i.test(
-        String(value || '').trim()
-    );
-}
-
-function makeSearchText(results, query) {
+function buildSearchList(results, query, watermark) {
     let text =
-        `🔎 *SINHALASUB SEARCH RESULTS*\n\n` +
-        `📌 *Query:* ${query}\n\n`;
+        `🎬 *SINHALASUB MOVIE SEARCH*\n\n` +
+        `🔎 *Search:* ${query}\n\n`;
 
-    results.forEach((movie, index) => {
+    results.forEach((item, index) => {
         text +=
-            `*${index + 1}.* ${getTitle(movie)}\n`;
+            `*${index + 1}.* ${getResultTitle(item)}\n` +
+            `📂 ${item?.type || 'movies'}\n\n`;
     });
 
     text +=
-        `\n━━━━━━━━━━━━━━━━━━\n` +
-        `👉 *Reply 1-${results.length} to select a movie.*`;
+        `👉 *Reply 1-${results.length} to select a movie.*\n\n` +
+        `─── *${watermark}* ───`;
 
-    return text;
+    return text.trim();
 }
 
-function makeMovieInfo(movie) {
-    const lines = [
-        `🎬 *${getTitle(movie)}*`
-    ];
+function buildMovieInfo(movie, links, watermark) {
+    let text =
+        `🎬 *SINHALASUB MOVIE*\n\n` +
+        `📌 *Title:* ${movie?.title || 'Unknown'}\n`;
 
     if (movie?.release_date) {
-        lines.push(
-            `📅 Release: ${clean(movie.release_date)}`
-        );
-    }
-
-    if (movie?.country) {
-        lines.push(
-            `🌍 Country: ${clean(movie.country)}`
-        );
+        text +=
+            `📅 *Release:* ${movie.release_date}\n`;
     }
 
     if (movie?.duration) {
-        lines.push(
-            `⏱️ Duration: ${clean(movie.duration)}`
-        );
+        text +=
+            `⏱️ *Duration:* ${movie.duration}\n`;
+    }
+
+    if (movie?.country) {
+        text +=
+            `🌍 *Country:* ${movie.country}\n`;
     }
 
     if (movie?.IMDb_Rating) {
-        lines.push(
-            `⭐ IMDb: ${clean(movie.IMDb_Rating)}`
-        );
+        text +=
+            `⭐ *IMDb:* ${movie.IMDb_Rating}\n`;
     }
 
     if (movie?.TMDb_Rating) {
-        lines.push(
-            `⭐ TMDb: ${clean(movie.TMDb_Rating)}`
-        );
+        text +=
+            `⭐ *TMDb:* ${movie.TMDb_Rating}\n`;
     }
 
-    if (
-        Array.isArray(movie?.categories) &&
-        movie.categories.length
-    ) {
-        lines.push(
-            `🏷️ Genres: ${movie.categories.join(', ')}`
-        );
-    }
-
-    return lines.join('\n');
-}
-
-function makeQualityMenu(movie, links) {
-    let text =
-        `${makeMovieInfo(movie)}\n\n` +
-        `📥 *AVAILABLE DOWNLOADS*\n\n`;
+    text +=
+        `\n📥 *AVAILABLE QUALITIES*\n\n`;
 
     links.forEach((item, index) => {
         text +=
-            `*${index + 1}.* ` +
-            `🎞️ ${getQuality(item)}` +
-            ` | 📦 ${getSize(item)}\n`;
+            `*${index + 1}.* ${item.quality}\n` +
+            `   📦 ${item.size || 'Unknown size'}\n\n`;
     });
 
     text +=
-        `\n━━━━━━━━━━━━━━━━━━\n` +
-        `👉 *Reply the number to download.*`;
+        `👉 *Reply the quality number to download.*\n\n` +
+        `─── *${watermark}* ───`;
 
-    return text;
+    return text.trim();
 }
 
-async function getMovie(url) {
-    if (
-        !SinhalaSub ||
-        typeof SinhalaSub.movie !== 'function'
-    ) {
-        throw new Error(
-            '@sl-code-lords/movie-api SinhalaSub.movie() unavailable.'
-        );
+function normalizeDownloadLinks(rawLinks) {
+    if (!Array.isArray(rawLinks)) {
+        return [];
     }
 
+    /*
+     * SinhalaSub can sometimes expose multiple mirrors
+     * with the same quality/size.
+     *
+     * Keep the actual quality and size shown by the API,
+     * but group duplicate quality+size entries so we can
+     * retry another mirror automatically if one fails.
+     */
+
+    const grouped = new Map();
+
+    for (const item of rawLinks) {
+        const quality =
+            cleanText(item?.quality);
+
+        const size =
+            cleanText(item?.size);
+
+        const link =
+            cleanText(item?.link);
+
+        if (
+            !quality ||
+            !link ||
+            !/^https?:\/\//i.test(link)
+        ) {
+            continue;
+        }
+
+        const key =
+            `${quality.toLowerCase()}|${size.toLowerCase()}`;
+
+        if (!grouped.has(key)) {
+            grouped.set(key, {
+                quality,
+                size: size || 'Unknown',
+                links: []
+            });
+        }
+
+        const entry =
+            grouped.get(key);
+
+        if (!entry.links.includes(link)) {
+            entry.links.push(link);
+        }
+    }
+
+    return [...grouped.values()];
+}
+
+
+// ============================================================
+// GET MOVIE DETAILS
+// ============================================================
+
+async function getMovieDetails(url) {
     const response =
         await SinhalaSub.movie(url);
 
-    if (
-        !response?.status ||
-        !response?.result
-    ) {
+    if (!response?.status) {
         throw new Error(
             'SinhalaSub movie details unavailable.'
+        );
+    }
+
+    if (!response?.result) {
+        throw new Error(
+            'Movie information was not found.'
         );
     }
 
     return response.result;
 }
 
-async function sendQualityMenu(
-    sock,
-    from,
-    msg,
-    movie
-) {
-    const links =
-        Array.isArray(movie?.dl_links)
-            ? movie.dl_links.filter(
-                item => getDownloadLink(item)
-            )
-            : [];
 
-    if (!links.length) {
-        await sock.sendMessage(
-            from,
-            {
-                text:
-                    `${makeMovieInfo(movie)}\n\n` +
-                    `❌ *Download qualities හමු වුණේ නැහැ.*`
-            },
-            {
-                quoted: msg
-            }
-        );
+// ============================================================
+// ATTACH REPLY LISTENER PER SOCKET
+// ============================================================
 
+function attachListener(sock) {
+    if (attachedSockets.has(sock)) {
         return;
     }
 
-    const text =
-        makeQualityMenu(
-            movie,
-            links
-        );
-
-    const poster =
-        movie?.images?.[0] ||
-        movie?.image ||
-        movie?.poster ||
-        null;
-
-    let sent = null;
-
-    if (poster) {
-        try {
-            sent =
-                await sock.sendMessage(
-                    from,
-                    {
-                        image: {
-                            url: poster
-                        },
-                        caption: text
-                    },
-                    {
-                        quoted: msg
-                    }
-                );
-        } catch {
-            sent = null;
-        }
-    }
-
-    if (!sent) {
-        sent =
-            await sock.sendMessage(
-                from,
-                {
-                    text
-                },
-                {
-                    quoted: msg
-                }
-            );
-    }
-
-    getStore(sock).set(
-        sent.key.id,
-        {
-            type: 'quality',
-            title: getTitle(movie),
-            links,
-            createdAt: Date.now()
-        }
-    );
-}
-
-function attachReplyListener(sock) {
-    const store =
-        getStore(sock);
-
-    if (store.listenerAttached) {
-        return;
-    }
-
-    store.listenerAttached = true;
+    attachedSockets.add(sock);
 
     sock.ev.on(
         'messages.upsert',
         async event => {
-            const msg =
-                event?.messages?.[0];
-
-            if (!msg?.message) {
-                return;
-            }
-
-            const from =
-                msg?.key?.remoteJid;
-
-            if (!from) {
-                return;
-            }
-
-            const quotedId =
-                getQuotedStanzaId(msg);
-
-            if (!quotedId) {
-                return;
-            }
-
-            const session =
-                store.get(quotedId);
-
-            if (!session) {
-                return;
-            }
-
-            const input =
-                getText(msg);
-
-            if (!input) {
-                return;
-            }
-
             try {
-                /*
-                 * SEARCH RESULT SELECTION
-                 */
+                const msg =
+                    event?.messages?.[0];
+
                 if (
-                    session.type ===
-                    'search'
+                    !msg?.message ||
+                    msg?.key?.fromMe
                 ) {
-                    const number =
+                    return;
+                }
+
+                const quotedStanzaId =
+                    getQuotedStanzaId(msg);
+
+                if (!quotedStanzaId) {
+                    return;
+                }
+
+                const session =
+                    sessions.get(
+                        quotedStanzaId
+                    );
+
+                if (!session) {
+                    return;
+                }
+
+                const from =
+                    msg.key.remoteJid;
+
+                if (!from) {
+                    return;
+                }
+
+                const text =
+                    getTextFromMessage(msg);
+
+                if (!text) {
+                    return;
+                }
+
+                // ====================================================
+                // SEARCH RESULT SELECTION
+                // ====================================================
+
+                if (
+                    session.step ===
+                    'search_select'
+                ) {
+                    const choice =
                         Number.parseInt(
-                            input,
+                            text,
                             10
                         );
 
                     if (
-                        !Number.isInteger(
-                            number
-                        ) ||
-                        number < 1 ||
-                        number >
-                            session.results
-                                .length
+                        !Number.isInteger(choice) ||
+                        choice < 1 ||
+                        choice >
+                            session.results.length
                     ) {
-                        await sock.sendMessage(
+                        return await sock.sendMessage(
                             from,
                             {
                                 text:
-                                    `⚠️ *Reply 1-${session.results.length} කරන්න.*`
+                                    `⚠️ *Reply a number from 1-${session.results.length}.*`
                             },
-                            {
-                                quoted: msg
-                            }
+                            { quoted: msg }
                         );
-
-                        return;
                     }
 
                     const selected =
                         session.results[
-                            number - 1
+                            choice - 1
                         ];
 
                     if (
                         !selected?.link
                     ) {
-                        throw new Error(
-                            'Selected movie URL unavailable.'
+                        return await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '❌ මේ movie එකට link එකක් හමු වුණේ නැහැ.'
+                            },
+                            { quoted: msg }
                         );
                     }
 
@@ -406,387 +395,663 @@ function attachReplyListener(sock) {
                         from,
                         {
                             text:
-                                `⏳ *Movie details ලබාගනිමින්...*`
+                                '⏳ *Movie details ලබාගන්නවා...*'
                         },
+                        { quoted: msg }
+                    );
+
+                    let movie;
+
+                    try {
+                        movie =
+                            await getMovieDetails(
+                                selected.link
+                            );
+                    } catch (error) {
+                        console.error(
+                            '[SINHALASUB] Details Error:',
+                            error
+                        );
+
+                        return await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '❌ *Movie details ලබාගැනීමට නොහැකි විය.*'
+                            },
+                            { quoted: msg }
+                        );
+                    }
+
+                    const links =
+                        normalizeDownloadLinks(
+                            movie?.dl_links
+                        );
+
+                    if (!links.length) {
+                        return await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    '❌ *මේ movie එකට download links හමු වුණේ නැහැ.*'
+                            },
+                            { quoted: msg }
+                        );
+                    }
+
+                    const watermark =
+                        session.config
+                            ?.WATERMARK ||
+                        'MrNobody Serenity';
+
+                    const infoText =
+                        buildMovieInfo(
+                            movie,
+                            links,
+                            watermark
+                        );
+
+                    let sentMsg;
+
+                    const poster =
+                        Array.isArray(
+                            movie?.images
+                        ) &&
+                        movie.images.length
+                            ? movie.images[0]
+                            : null;
+
+                    if (poster) {
+                        try {
+                            sentMsg =
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        image: {
+                                            url:
+                                                poster
+                                        },
+                                        caption:
+                                            infoText
+                                    },
+                                    {
+                                        quoted:
+                                            msg
+                                    }
+                                );
+                        } catch {
+                            sentMsg =
+                                await sock.sendMessage(
+                                    from,
+                                    {
+                                        text:
+                                            infoText
+                                    },
+                                    {
+                                        quoted:
+                                            msg
+                                    }
+                                );
+                        }
+                    } else {
+                        sentMsg =
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        infoText
+                                },
+                                {
+                                    quoted:
+                                        msg
+                                }
+                            );
+                    }
+
+                    sessions.set(
+                        sentMsg.key.id,
                         {
-                            quoted: msg
+                            step:
+                                'quality_select',
+                            movie,
+                            links,
+                            config:
+                                session.config,
+                            timestamp:
+                                Date.now()
                         }
                     );
 
-                    const movie =
-                        await getMovie(
-                            selected.link
-                        );
-
-                    store.delete(
-                        quotedId
-                    );
-
-                    await sendQualityMenu(
-                        sock,
-                        from,
-                        msg,
-                        movie
+                    sessions.delete(
+                        quotedStanzaId
                     );
 
                     return;
                 }
 
-                /*
-                 * QUALITY SELECTION
-                 */
+
+                // ====================================================
+                // QUALITY SELECTION
+                // ====================================================
+
                 if (
-                    session.type ===
-                    'quality'
+                    session.step !==
+                    'quality_select'
                 ) {
-                    const number =
-                        Number.parseInt(
-                            input,
-                            10
-                        );
+                    return;
+                }
 
-                    if (
-                        !Number.isInteger(
-                            number
-                        ) ||
-                        number < 1 ||
-                        number >
-                            session.links
-                                .length
-                    ) {
-                        await sock.sendMessage(
-                            from,
-                            {
-                                text:
-                                    `⚠️ *Reply 1-${session.links.length} කරන්න.*`
-                            },
-                            {
-                                quoted: msg
-                            }
-                        );
+                const choice =
+                    Number.parseInt(
+                        text,
+                        10
+                    );
 
-                        return;
+                if (
+                    !Number.isInteger(choice) ||
+                    choice < 1 ||
+                    choice > session.links.length
+                ) {
+                    return await sock.sendMessage(
+                        from,
+                        {
+                            text:
+                                `⚠️ *Reply a number from 1-${session.links.length}.*`
+                        },
+                        { quoted: msg }
+                    );
+                }
+
+                const selected =
+                    session.links[
+                        choice - 1
+                    ];
+
+                if (
+                    !selected?.links?.length
+                ) {
+                    return await sock.sendMessage(
+                        from,
+                        {
+                            text:
+                                '❌ *Download link එකක් හමු වුණේ නැහැ.*'
+                        },
+                        { quoted: msg }
+                    );
+                }
+
+                const watermark =
+                    session.config
+                        ?.WATERMARK ||
+                    'MrNobody Serenity';
+
+                await sock.sendMessage(
+                    from,
+                    {
+                        text:
+                            `⏳ *Downloading...*\n\n` +
+                            `🎬 ${session.movie?.title || 'Movie'}\n` +
+                            `🎚️ *Quality:* ${selected.quality}\n` +
+                            `📦 *Size:* ${selected.size}\n\n` +
+                            `_Please wait..._`
+                    },
+                    { quoted: msg }
+                );
+
+                const reportedBytes =
+                    parseSizeToBytes(
+                        selected.size
+                    );
+
+                /*
+                 * <= 80 MB  -> WhatsApp Video
+                 * >  80 MB  -> WhatsApp Document
+                 *
+                 * Unknown size is sent as document
+                 * so we don't falsely claim it is safe
+                 * for video upload.
+                 */
+
+                const sendAsVideo =
+                    Number.isFinite(
+                        reportedBytes
+                    ) &&
+                    reportedBytes <=
+                        MAX_VIDEO_SIZE;
+
+                let sent = false;
+                let lastError = null;
+
+                for (
+                    const downloadUrl
+                    of selected.links
+                ) {
+                    try {
+                        const fileName =
+                            `${cleanFileName(
+                                session.movie?.title ||
+                                'SinhalaSub Movie'
+                            )} - ${cleanFileName(
+                                selected.quality
+                            )}.mp4`;
+
+                        if (sendAsVideo) {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    video: {
+                                        url:
+                                            downloadUrl
+                                    },
+                                    mimetype:
+                                        'video/mp4',
+                                    fileName,
+                                    caption:
+                                        `🎬 *${session.movie?.title || 'SinhalaSub Movie'}*\n\n` +
+                                        `🎚️ *Quality:* ${selected.quality}\n` +
+                                        `📦 *Size:* ${selected.size}\n\n` +
+                                        `─── *${watermark}* ───`
+                                },
+                                {
+                                    quoted:
+                                        msg
+                                }
+                            );
+                        } else {
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    document: {
+                                        url:
+                                            downloadUrl
+                                    },
+                                    mimetype:
+                                        'video/mp4',
+                                    fileName,
+                                    caption:
+                                        `🎬 *${session.movie?.title || 'SinhalaSub Movie'}*\n\n` +
+                                        `🎚️ *Quality:* ${selected.quality}\n` +
+                                        `📦 *Size:* ${selected.size}\n\n` +
+                                        `📁 *Sent as Document*\n\n` +
+                                        `─── *${watermark}* ───`
+                                },
+                                {
+                                    quoted:
+                                        msg
+                                }
+                            );
+                        }
+
+                        sent = true;
+                        break;
+                    } catch (error) {
+                        lastError =
+                            error;
+
+                        console.error(
+                            '[SINHALASUB] Mirror failed:',
+                            downloadUrl,
+                            error?.message ||
+                                error
+                        );
                     }
+                }
 
-                    const selected =
-                        session.links[
-                            number - 1
-                        ];
-
-                    const url =
-                        getDownloadLink(
-                            selected
-                        );
-
-                    if (!url) {
-                        throw new Error(
-                            'Selected download link unavailable.'
-                        );
-                    }
-
-                    const quality =
-                        getQuality(
-                            selected
-                        );
-
-                    const size =
-                        getSize(
-                            selected
-                        );
-
-                    /*
-                     * Consume the session before
-                     * starting the transfer.
-                     */
-                    store.delete(
-                        quotedId
+                if (!sent) {
+                    console.error(
+                        '[SINHALASUB] All mirrors failed:',
+                        lastError
                     );
 
                     await sock.sendMessage(
                         from,
                         {
                             text:
-                                `⬇️ *Download starting...*\n\n` +
-                                `🎬 ${session.title}\n` +
-                                `🎞️ Quality: *${quality}*\n` +
-                                `📦 Size: *${size}*`
+                                '❌ *Movie එක Download කරන්න බැරි වුණා.*\n\n' +
+                                'ඒ quality එකේ වෙනත් mirror එකක් තිබුණොත් ඒකත් automatically try කළා.'
                         },
-                        {
-                            quoted: msg
-                        }
-                    );
-
-                    /*
-                     * The npm API provides the actual
-                     * download URL, so Baileys receives
-                     * it directly as a document.
-                     */
-                    await sock.sendMessage(
-                        from,
-                        {
-                            document: {
-                                url
-                            },
-
-                            mimetype:
-                                'video/mp4',
-
-                            fileName:
-                                `${clean(
-                                    session.title
-                                )} - ${quality}`
-                                    .replace(
-                                        /[\\/:*?"<>|]/g,
-                                        ''
-                                    )
-                                    .slice(
-                                        0,
-                                        180
-                                    ) +
-                                '.mp4',
-
-                            caption:
-                                `🎬 *${session.title}*\n` +
-                                `🎞️ Quality: *${quality}*\n` +
-                                `📦 Size: *${size}*`
-                        },
-                        {
-                            quoted: msg
-                        }
+                        { quoted: msg }
                     );
                 }
+
+                sessions.delete(
+                    quotedStanzaId
+                );
+
             } catch (error) {
                 console.error(
-                    '[SINHALASUB] Reply Error:',
+                    '[SINHALASUB] Listener Error:',
                     error
                 );
-
-                store.delete(
-                    quotedId
-                );
-
-                await sock.sendMessage(
-                    from,
-                    {
-                        text:
-                            `❌ *SinhalaSub error!*\n\n` +
-                            `${error?.message || 'Unknown error'}`
-                    },
-                    {
-                        quoted: msg
-                    }
-                ).catch(() => {});
             }
         }
     );
 }
 
+
+// ============================================================
+// PLUGIN
+// ============================================================
+
 export default {
     pattern: 'sinhalasub',
+    alias: ['ssub', 'ss'],
+    category: 'download',
+    desc: 'Search and download SinhalaSub movies',
 
-    alias: [
-        'ss',
-        'ssub'
-    ],
+    function: async (
+        sock,
+        msg,
+        {
+            from,
+            args,
+            config
+        }
+    ) => {
+        try {
+            attachListener(sock);
 
-    category:
-        'download',
-
-    desc:
-        'Search and download SinhalaSub movies',
-
-    function:
-        async (
-            sock,
-            msg,
-            {
-                from,
-                args
-            }
-        ) => {
-            attachReplyListener(
-                sock
-            );
-
-            const input =
+            const query =
                 args.join(' ').trim();
 
-            /*
-             * HELP
-             */
-            if (!input) {
+            const watermark =
+                config.WATERMARK ||
+                'MrNobody Serenity';
+
+            if (!query) {
                 return await sock.sendMessage(
                     from,
                     {
                         text:
                             `🎬 *SINHALASUB MOVIE DOWNLOADER*\n\n` +
-                            `🔎 Search:\n` +
-                            `*.sinhalasub Avatar*\n\n` +
-                            `🔗 Direct URL:\n` +
-                            `*.sinhalasub https://sinhalasub.lk/movies/...*`
+                            `භාවිතා කරන විදිහ:\n\n` +
+                            `*.sinhalasub movie name*\n` +
+                            `*.sinhalasub https://sinhalasub.lk/...*\n\n` +
+                            `─── *${watermark}* ───`
                     },
-                    {
-                        quoted: msg
-                    }
+                    { quoted: msg }
                 );
             }
 
-            try {
-                /*
-                 * DIRECT MOVIE URL
-                 */
-                if (
-                    isHttpUrl(
-                        input
-                    )
-                ) {
-                    await sock.sendMessage(
-                        from,
-                        {
-                            text:
-                                `⏳ *Movie details ලබාගනිමින්...*`
-                        },
-                        {
-                            quoted: msg
-                        }
-                    );
 
-                    const movie =
-                        await getMovie(
-                            input
-                        );
+            // ========================================================
+            // DIRECT URL
+            // ========================================================
 
-                    await sendQualityMenu(
-                        sock,
-                        from,
-                        msg,
-                        movie
-                    );
+            if (
+                isSinhalaSubUrl(query)
+            ) {
+                const url =
+                    normalizeUrl(query);
 
-                    return;
-                }
-
-                /*
-                 * SEARCH
-                 */
                 await sock.sendMessage(
                     from,
                     {
                         text:
-                            `🔎 *SinhalaSub search කරනවා...*\n\n` +
-                            `🎬 ${input}`
+                            '⏳ *Movie details ලබාගන්නවා...*'
                     },
-                    {
-                        quoted: msg
-                    }
+                    { quoted: msg }
                 );
 
-                if (
-                    !SinhalaSub ||
-                    !SinhalaSub.get_list ||
-                    !SinhalaSub.get_list.by_search
-                ) {
-                    throw new Error(
-                        '@sl-code-lords/movie-api search API unavailable.'
-                    );
-                }
+                let movie;
 
-                const response =
-                    await SinhalaSub
-                        .get_list
-                        .by_search(
-                            input
+                try {
+                    movie =
+                        await getMovieDetails(
+                            url
                         );
-
-                if (
-                    !response?.status
-                ) {
-                    throw new Error(
-                        'SinhalaSub search failed.'
+                } catch (error) {
+                    console.error(
+                        '[SINHALASUB] Direct URL Error:',
+                        error
                     );
-                }
 
-                const results =
-                    Array.isArray(
-                        response.results
-                    )
-                        ? response.results
-                            .filter(
-                                item =>
-                                    item?.link &&
-                                    (
-                                        !item?.type ||
-                                        item.type ===
-                                            'movies'
-                                    )
-                            )
-                            .slice(
-                                0,
-                                MAX_RESULTS
-                            )
-                        : [];
-
-                if (!results.length) {
                     return await sock.sendMessage(
                         from,
                         {
                             text:
-                                `❌ *${input}* සඳහා movies හමු වුණේ නැහැ.`
+                                '❌ *SinhalaSub movie එක හඳුනාගැනීමට නොහැකි විය.*'
                         },
-                        {
-                            quoted: msg
-                        }
+                        { quoted: msg }
                     );
                 }
 
-                const sent =
-                    await sock.sendMessage(
+                const links =
+                    normalizeDownloadLinks(
+                        movie?.dl_links
+                    );
+
+                if (!links.length) {
+                    return await sock.sendMessage(
                         from,
                         {
                             text:
-                                makeSearchText(
-                                    results,
-                                    input
-                                )
+                                '❌ *මේ movie එකට download qualities හමු වුණේ නැහැ.*'
                         },
-                        {
-                            quoted: msg
-                        }
+                        { quoted: msg }
+                    );
+                }
+
+                const infoText =
+                    buildMovieInfo(
+                        movie,
+                        links,
+                        watermark
                     );
 
-                /*
-                 * The reply to this exact message
-                 * selects the movie.
-                 */
-                getStore(sock).set(
-                    sent.key.id,
+                let sentMsg;
+
+                const poster =
+                    Array.isArray(
+                        movie?.images
+                    ) &&
+                    movie.images.length
+                        ? movie.images[0]
+                        : null;
+
+                if (poster) {
+                    try {
+                        sentMsg =
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    image: {
+                                        url:
+                                            poster
+                                    },
+                                    caption:
+                                        infoText
+                                },
+                                {
+                                    quoted:
+                                        msg
+                                }
+                            );
+                    } catch {
+                        sentMsg =
+                            await sock.sendMessage(
+                                from,
+                                {
+                                    text:
+                                        infoText
+                                },
+                                {
+                                    quoted:
+                                        msg
+                                }
+                            );
+                    }
+                } else {
+                    sentMsg =
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    infoText
+                            },
+                            {
+                                quoted:
+                                    msg
+                            }
+                        );
+                }
+
+                sessions.set(
+                    sentMsg.key.id,
                     {
-                        type:
-                            'search',
-
-                        results,
-
-                        createdAt:
+                        step:
+                            'quality_select',
+                        movie,
+                        links,
+                        config,
+                        timestamp:
                             Date.now()
                     }
                 );
-            } catch (error) {
-                console.error(
-                    '[SINHALASUB] Command Error:',
-                    error
+
+                return;
+            }
+
+
+            // ========================================================
+            // SEARCH
+            // ========================================================
+
+            await sock.sendMessage(
+                from,
+                {
+                    text:
+                        `🔎 *Searching SinhalaSub...*\n\n` +
+                        `🎬 *Query:* ${query}`
+                },
+                { quoted: msg }
+            );
+
+            const response =
+                await SinhalaSub
+                    .get_list
+                    .by_search(query);
+
+            if (
+                !response?.status
+            ) {
+                return await sock.sendMessage(
+                    from,
+                    {
+                        text:
+                            '❌ *SinhalaSub search failed.*'
+                    },
+                    { quoted: msg }
+                );
+            }
+
+            const allResults =
+                Array.isArray(
+                    response.results
+                )
+                    ? response.results
+                    : [];
+
+            /*
+             * User asked for movies.
+             * Filter out TV shows from the search result.
+             */
+
+            const movieResults =
+                allResults
+                    .filter(
+                        item =>
+                            String(
+                                item?.type || ''
+                            )
+                                .toLowerCase() ===
+                            'movies'
+                    )
+                    .slice(0, 10);
+
+            if (!movieResults.length) {
+                return await sock.sendMessage(
+                    from,
+                    {
+                        text:
+                            '❌ *මේ search එකට movies හමු වුණේ නැහැ.*'
+                    },
+                    { quoted: msg }
+                );
+            }
+
+            const searchText =
+                buildSearchList(
+                    movieResults,
+                    query,
+                    watermark
                 );
 
+            const sentMsg =
                 await sock.sendMessage(
                     from,
                     {
                         text:
-                            `❌ *SinhalaSub error!*\n\n` +
-                            `${error?.message || 'Unknown error'}`
+                            searchText
                     },
                     {
-                        quoted: msg
+                        quoted:
+                            msg
                     }
-                ).catch(() => {});
-            }
+                );
+
+            sessions.set(
+                sentMsg.key.id,
+                {
+                    step:
+                        'search_select',
+                    results:
+                        movieResults,
+                    config,
+                    timestamp:
+                        Date.now()
+                }
+            );
+
+        } catch (error) {
+            console.error(
+                '[SINHALASUB] Command Error:',
+                error
+            );
+
+            await sock.sendMessage(
+                from,
+                {
+                    text:
+                        `❌ *SinhalaSub command error.*\n\n` +
+                        `${error?.message || 'Unknown error'}`
+                },
+                { quoted: msg }
+            );
         }
+    }
 };
+
+
+// ============================================================
+// CLEAN OLD SESSIONS
+// ============================================================
+
+setInterval(() => {
+    const now = Date.now();
+
+    for (
+        const [
+            key,
+            session
+        ] of sessions.entries()
+    ) {
+        if (
+            !session?.timestamp ||
+            now - session.timestamp >
+                5 * 60 * 1000
+        ) {
+            sessions.delete(key);
+        }
+    }
+}, 60 * 1000);
