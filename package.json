@@ -21,6 +21,7 @@
     "youtube-dl-exec": "^3.1.15",
     "sadaslk-dlcore": "^1.0.0",
     "@sl-code-lords/youtube-dl": "^1.0.4",
+    "@sl-code-lords/movie-api": "1.0.0"
     "facebook-dl": "^1.0.0",
     "@hiudyy/ytdl": "^0.2.6",
     "btch-downloader": "^6.4.0",
