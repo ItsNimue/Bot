@@ -33,7 +33,23 @@ async function loadPlugins() {
             const plugin = module.default;
 
             if (plugin?.pattern) {
-                commands.set(plugin.pattern, plugin);
+                commands.set(plugin.pattern.toLowerCase(), plugin);
+
+                const aliases = Array.isArray(plugin.alias)
+                    ? plugin.alias
+                    : (plugin.alias ? [plugin.alias] : []);
+
+                for (const alias of aliases) {
+                    if (!alias) continue;
+                    const key = String(alias).toLowerCase();
+
+                    if (commands.has(key)) {
+                        console.warn(`⚠️ Alias "${key}" (from ${file}) conflicts and was skipped.`);
+                        continue;
+                    }
+
+                    commands.set(key, plugin);
+                }
             }
         } catch (err) {
             console.error(
