@@ -1,608 +1,1445 @@
 import yts from 'yt-search';
-import yt from '@vreden/youtube_scraper';
-import axios from 'axios';
-import ffmpegPath from 'ffmpeg-static';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import youtubedl from 'youtube-dl-exec';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
-// ============================================================
-// MRNOBODY YOUTUBE VIDEO DOWNLOADER
-// Video → 1.1 / 1.2 / 1.3 ...   Document → 2.1 / 2.2 / 2.3 ...
-// Only qualities that actually exist for THIS video are shown.
-// Tier 1: ytdlp-nodejs (real per-video formats, up to 4K)
-// Tier 2/3: @vreden/youtube_scraper + api.vreden.my.id fallback
-// ============================================================
+const MAX_FILE_SIZE = 80 * 1000 * 1000;
+const SESSION_TTL = 5 * 60 * 1000;
+const MAX_RESULTS = 10;
 
-// Direct-video-message limit (safe inline playback size)
-const VIDEO_INLINE_LIMIT = 100 * 1000 * 1000; // 100 MB
-// Absolute cap — beyond this we refuse (too big for WhatsApp)
-const DOCUMENT_LIMIT = 2 * 1000 * 1000 * 1000; // 2 GB
+const QUALITY_OPTIONS = [
+    144,
+    360,
+    480,
+    720,
+    1080
+];
 
-// Fixed fallback ladder used only when the ytdlp-nodejs tier fails
-const FALLBACK_LADDER = [144, 240, 360, 480, 720, 1080];
+const YOUTUBE_HOSTS = new Set([
+    'youtube.com',
+    'www.youtube.com',
+    'm.youtube.com',
+    'music.youtube.com',
+    'youtu.be'
+]);
 
-const ytUrlRegex = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:[^\/\n\s]+\/\S+\/|(?:v|e(?:mbed)?)\/|\S*?[?&]v=)|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
-const choiceRegex = /^([12])\.(\d+)$/;
+/*
+|--------------------------------------------------------------------------
+| SESSION STORAGE
+|--------------------------------------------------------------------------
+| One store per WhatsApp socket.
+| This prevents different linked devices/users from sharing sessions.
+|--------------------------------------------------------------------------
+*/
 
-// Multi-session storage with TTL (same pattern as song.js)
-const videoSessions = new Map();
-let isListenerAttached = false;
+const socketStores = new WeakMap();
+const activeStores = new Set();
+
+function getStore(sock) {
+    let store = socketStores.get(sock);
+
+    if (!store) {
+        store = new Map();
+
+        socketStores.set(sock, store);
+        activeStores.add(store);
+    }
+
+    return store;
+}
+
+/*
+|--------------------------------------------------------------------------
+| SESSION CLEANUP
+|--------------------------------------------------------------------------
+*/
 
 setInterval(() => {
     const now = Date.now();
-    for (const [key, value] of videoSessions.entries()) {
-        if (now - value.timestamp > 5 * 60 * 1000) {
-            videoSessions.delete(key);
-        }
-    }
-}, 60 * 1000);
 
-// ============================================================
-// HELPERS
-// ============================================================
-
-function cleanFileName(name) {
-    return String(name || 'YouTube Video')
-        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 180) || 'YouTube Video';
-}
-
-function formatBytesDecimal(bytes) {
-    if (!Number.isFinite(Number(bytes)) || Number(bytes) <= 0) {
-        return null;
-    }
-    let size = Number(bytes);
-    const units = ['Bytes', 'KB', 'MB', 'GB'];
-    let index = 0;
-    while (size >= 1000 && index < units.length - 1) {
-        size /= 1000;
-        index++;
-    }
-    return `${size.toFixed(index === 0 ? 0 : 2)} ${units[index]}`;
-}
-
-function formatViews(views) {
-    if (views === undefined || views === null || views === '' || views === 'N/A') return 'N/A';
-    const n = Number(String(views).replace(/,/g, ''));
-    if (!Number.isFinite(n)) return String(views);
-    return new Intl.NumberFormat('en-US').format(n);
-}
-
-function getChannelName(item) {
-    return item?.author?.name || item?.author?.channelName || item?.channel?.name ||
-        item?.channelName || item?.metadata?.author?.name || item?.metadata?.channelName ||
-        item?.uploader || item?.metadata?.uploader || 'N/A';
-}
-
-function getDuration(item) {
-    return item?.timestamp || item?.duration?.timestamp || item?.duration ||
-        item?.metadata?.duration?.timestamp || item?.metadata?.timestamp || 'N/A';
-}
-
-function getViews(item) {
-    return item?.views ?? item?.metadata?.views ?? item?.viewCount ?? item?.metadata?.viewCount ?? 'N/A';
-}
-
-function getThumbnail(item) {
-    return item?.image || item?.thumbnail || item?.metadata?.image ||
-        item?.thumbnails?.[0]?.url || item?.thumbnailUrl;
-}
-
-function getTitle(item) {
-    return item?.title || item?.metadata?.title || 'YouTube Video';
-}
-
-function extractDownloadUrl(res) {
-    if (!res) return null;
-    if (typeof res === 'string' && res.startsWith('http')) return res;
-    if (res.download?.url) return res.download.url;
-    if (res.download && typeof res.download === 'string') return res.download;
-    if (res.result?.download?.url) return res.result.download.url;
-    if (res.result?.download && typeof res.result.download === 'string') return res.result.download;
-    if (res.url) return res.url;
-    return null;
-}
-
-function qualityLabel(height) {
-    if (height >= 2160) return '4K (2160p)';
-    if (height >= 1440) return '2K (1440p)';
-    return `${height}p`;
-}
-
-// ============================================================
-// QUALITY DISCOVERY
-// ============================================================
-
-// Tier 1: ytdlp-nodejs — real per-video formats, can reach 4K.
-// If the binary can't be used on this host (blocked spawn/download),
-// this simply fails and we drop to the fallback ladder below.
-async function getQualitiesViaYtdlp(url) {
-    try {
-        const { YtDlp } = await import('ytdlp-nodejs');
-        const ytdlp = new YtDlp();
-
-        const info = await ytdlp.getInfoAsync(url);
-        const formats = info?.formats || [];
-
-        const heightMap = new Map();
-
-        for (const f of formats) {
-            const height = Number(f.height);
-            if (!height || f.vcodec === 'none') continue;
-
-            const hasAudio = !!(f.acodec && f.acodec !== 'none');
-            const score = (f.ext === 'mp4' ? 2 : 0) + (hasAudio ? 1 : 0);
-            const existing = heightMap.get(height);
-
-            if (!existing || score > existing.score) {
-                heightMap.set(height, {
-                    height,
-                    formatId: f.format_id,
-                    hasAudio,
-                    filesize: f.filesize || f.filesize_approx || null,
-                    score
-                });
+    for (const store of activeStores) {
+        for (const [id, session] of store.entries()) {
+            if (
+                session.createdAt &&
+                now - session.createdAt > SESSION_TTL
+            ) {
+                store.delete(id);
             }
         }
 
-        const qualities = [...heightMap.values()]
-            .sort((a, b) => a.height - b.height)
-            .map(q => ({
-                label: qualityLabel(q.height),
-                height: q.height,
-                formatId: q.formatId,
-                hasAudio: q.hasAudio,
-                filesize: q.filesize,
-                tier: 'ytdlp'
-            }));
+        if (store.size === 0) {
+            activeStores.delete(store);
+        }
+    }
+}, 60 * 1000).unref?.();
 
-        return qualities.length ? qualities : null;
-    } catch (err) {
-        console.log('[VIDEO] ytdlp-nodejs quality detection failed, using fallback ladder:', err.message);
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function isYouTubeUrl(value) {
+    try {
+        const url = new URL(value);
+
+        return (
+            (url.protocol === 'http:' ||
+                url.protocol === 'https:') &&
+            YOUTUBE_HOSTS.has(
+                url.hostname.toLowerCase()
+            )
+        );
+    } catch {
+        return false;
+    }
+}
+
+function cleanYouTubeUrl(value) {
+    const url = new URL(value);
+
+    if (
+        !YOUTUBE_HOSTS.has(
+            url.hostname.toLowerCase()
+        )
+    ) {
+        throw new Error(
+            'Invalid YouTube URL.'
+        );
+    }
+
+    return url.toString();
+}
+
+function cleanFileName(name) {
+    return String(
+        name || 'YouTube Video'
+    )
+        .replace(
+            /[<>:"/\\|?*\x00-\x1F]/g,
+            ''
+        )
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 180) ||
+        'YouTube Video';
+}
+
+function formatBytes(bytes) {
+    const n = Number(bytes);
+
+    if (!Number.isFinite(n) || n < 0) {
+        return 'N/A';
+    }
+
+    if (n < 1000) {
+        return `${n} B`;
+    }
+
+    if (n < 1000 * 1000) {
+        return `${(n / 1000).toFixed(2)} KB`;
+    }
+
+    if (n < 1000 * 1000 * 1000) {
+        return `${(
+            n /
+            (1000 * 1000)
+        ).toFixed(2)} MB`;
+    }
+
+    return `${(
+        n /
+        (1000 * 1000 * 1000)
+    ).toFixed(2)} GB`;
+}
+
+function formatDuration(seconds) {
+    const n = Number(seconds);
+
+    if (!Number.isFinite(n) || n < 0) {
+        return 'N/A';
+    }
+
+    const total = Math.floor(n);
+
+    const hours = Math.floor(
+        total / 3600
+    );
+
+    const minutes = Math.floor(
+        (total % 3600) / 60
+    );
+
+    const secs = total % 60;
+
+    if (hours > 0) {
+        return (
+            `${hours}:` +
+            `${String(minutes).padStart(
+                2,
+                '0'
+            )}:` +
+            `${String(secs).padStart(
+                2,
+                '0'
+            )}`
+        );
+    }
+
+    return (
+        `${minutes}:` +
+        `${String(secs).padStart(2, '0')}`
+    );
+}
+
+function getText(msg) {
+    return String(
+        msg?.message?.conversation ||
+            msg?.message?.extendedTextMessage?.text ||
+            msg?.message?.imageMessage?.caption ||
+            msg?.message?.videoMessage?.caption ||
+            ''
+    ).trim();
+}
+
+function getQuotedStanzaId(msg) {
+    return (
+        msg?.message
+            ?.extendedTextMessage
+            ?.contextInfo
+            ?.stanzaId ||
+        msg?.message
+            ?.imageMessage
+            ?.contextInfo
+            ?.stanzaId ||
+        msg?.message
+            ?.videoMessage
+            ?.contextInfo
+            ?.stanzaId ||
+        null
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| QUALITY
+|--------------------------------------------------------------------------
+*/
+
+function getFormats(info) {
+    return Array.isArray(info?.formats)
+        ? info.formats
+        : [];
+}
+
+function getAvailableVideoHeights(info) {
+    return [
+        ...new Set(
+            getFormats(info)
+                .filter(
+                    format =>
+                        format?.vcodec &&
+                        format.vcodec !== 'none' &&
+                        Number.isFinite(
+                            Number(format.height)
+                        )
+                )
+                .map(format =>
+                    Number(format.height)
+                )
+                .filter(height =>
+                    height > 0
+                )
+        )
+    ].sort((a, b) => a - b);
+}
+
+function findNearestQuality(
+    availableHeights,
+    requested
+) {
+    if (!availableHeights.length) {
         return null;
     }
-}
 
-// Tier fallback: fixed common ladder (used only if Tier 1 fails).
-// We can't cheaply confirm exact availability without downloading,
-// so scraper-tier downloads are attempted per selection and the
-// user is told clearly if a specific quality isn't available.
-function getFallbackQualities() {
-    return FALLBACK_LADDER.map(height => ({
-        label: qualityLabel(height),
-        height,
-        formatId: null,
-        hasAudio: true,
-        filesize: null,
-        tier: 'scraper'
-    }));
-}
+    return availableHeights.reduce(
+        (best, current) => {
+            const currentDistance =
+                Math.abs(
+                    current - requested
+                );
 
-async function getQualities(url) {
-    const real = await getQualitiesViaYtdlp(url);
-    return real || getFallbackQualities();
-}
+            const bestDistance =
+                Math.abs(
+                    best - requested
+                );
 
-// ============================================================
-// DOWNLOAD
-// ============================================================
+            /*
+             * If distance is equal,
+             * use the lower resolution.
+             */
+            if (
+                currentDistance <
+                bestDistance
+            ) {
+                return current;
+            }
 
-async function downloadWithYtdlp(url, quality) {
-    const { YtDlp } = await import('ytdlp-nodejs');
-    const ytdlp = new YtDlp();
+            if (
+                currentDistance ===
+                    bestDistance &&
+                current < best
+            ) {
+                return current;
+            }
 
-    const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const outPath = path.join(os.tmpdir(), `ytv_${uniqueId}.mp4`);
-
-    const formatStr = quality.hasAudio
-        ? quality.formatId
-        : `${quality.formatId}+bestaudio/best`;
-
-    await ytdlp.downloadAsync(url, {
-        format: formatStr,
-        output: outPath,
-        mergeOutputFormat: 'mp4',
-        ffmpegLocation: ffmpegPath
-    });
-
-    const buffer = fs.readFileSync(outPath);
-    fs.unlink(outPath, () => {});
-    return buffer;
-}
-
-async function downloadWithScraper(url, quality) {
-    const notes = [];
-
-    // Tier 2: @vreden/youtube_scraper (same package song.js already uses)
-    try {
-        const res = await yt.ytmp4(url, quality.height);
-        const downloadUrl = extractDownloadUrl(res);
-
-        if (downloadUrl) {
-            const response = await axios.get(downloadUrl, {
-                responseType: 'arraybuffer',
-                maxContentLength: Infinity,
-                maxBodyLength: Infinity
-            });
-            console.log(`[VIDEO] Tier2 (vreden scraper) success for ${quality.height}p`);
-            return { buffer: Buffer.from(response.data), notes };
+            return best;
         }
-        notes.push(`vreden-scraper: no download url (${JSON.stringify(res).slice(0, 150)})`);
-    } catch (e) {
-        notes.push(`vreden-scraper: ${e.message}`);
-        console.log('[VIDEO] Vreden ytmp4 Error:', e.message);
-    }
-
-    // Tier 3: direct public API fallback
-    try {
-        const fallback = await axios.get(
-            `https://api.vreden.my.id/api/ytmp4?url=${encodeURIComponent(url)}&quality=${quality.height}`,
-            { timeout: 30000 }
-        );
-        const downloadUrl = extractDownloadUrl(fallback.data);
-
-        if (downloadUrl) {
-            const response = await axios.get(downloadUrl, {
-                responseType: 'arraybuffer',
-                maxContentLength: Infinity,
-                maxBodyLength: Infinity
-            });
-            console.log(`[VIDEO] Tier3 (vreden api) success for ${quality.height}p`);
-            return { buffer: Buffer.from(response.data), notes };
-        }
-        notes.push(`vreden-api: no download url (${JSON.stringify(fallback.data).slice(0, 150)})`);
-    } catch (e) {
-        notes.push(`vreden-api: ${e.message}`);
-        console.log('[VIDEO] Vreden API Fallback Error:', e.message);
-    }
-
-    return { buffer: null, notes };
-}
-
-async function downloadQuality(url, quality) {
-    const notes = [];
-
-    if (quality.tier === 'ytdlp') {
-        try {
-            const buffer = await downloadWithYtdlp(url, quality);
-            console.log(`[VIDEO] Tier1 (ytdlp-nodejs) success for ${quality.height}p`);
-            return { buffer, notes };
-        } catch (e) {
-            notes.push(`ytdlp-nodejs: ${e.message}`);
-            console.log('[VIDEO] ytdlp-nodejs download failed, falling back to scraper tier:', e.message);
-        }
-    }
-
-    const scraperResult = await downloadWithScraper(url, quality);
-    return { buffer: scraperResult.buffer, notes: [...notes, ...scraperResult.notes] };
-}
-
-// ============================================================
-// UI CARDS
-// ============================================================
-
-function buildQualityCard({ title, duration, views, channel, url, qualities, watermark }) {
-    let text = `🎬 *MRNOBODY VIDEO DOWNLOADER* 🎬\n\n`;
-    text += `📌 *Title:* ${title}\n`;
-    text += `📺 *Channel:* ${channel}\n`;
-    text += `⏱️ *Duration:* ${duration}\n`;
-    text += `👁️ *Views:* ${formatViews(views)}\n`;
-    text += `🔗 *Link:* ${url}\n\n`;
-    text += `👇 *Reply the number below*\n\n`;
-
-    text += `🎥 *VIDEO — Send as Video*\n`;
-    qualities.forEach((q, i) => {
-        const size = formatBytesDecimal(q.filesize);
-        text += `*1.${i + 1}* — ${q.label}${size ? `  •  ${size}` : ''}\n`;
-    });
-
-    text += `\n📄 *DOCUMENT — Send as File*\n`;
-    qualities.forEach((q, i) => {
-        const size = formatBytesDecimal(q.filesize);
-        text += `*2.${i + 1}* — ${q.label}${size ? `  •  ${size}` : ''}\n`;
-    });
-
-    text += `\n─── *${watermark}* ───`;
-    return text;
-}
-
-function buildSearchList(videos, watermark) {
-    let text = `🔍 *YOUTUBE VIDEO SEARCH RESULTS* 🔍\n\n`;
-
-    videos.forEach((v, i) => {
-        text += `*${i + 1}.* ${getTitle(v)}\n`;
-        text += `📺 ${getChannelName(v)}\n`;
-        text += `⏱️ ${getDuration(v)}  •  👁️ ${formatViews(getViews(v))} views\n`;
-        text += `🔗 ${v.url}\n\n`;
-    });
-
-    text += `👉 *අදාළ අංකය (1-${videos.length}) Reply කරන්න.*\n\n`;
-    text += `─── *${watermark}* ───`;
-    return text.trim();
-}
-
-// ============================================================
-// SENDERS
-// ============================================================
-
-async function sendAsVideo(sock, from, msg, session, buffer, watermark) {
-    if (buffer.length > VIDEO_INLINE_LIMIT) {
-        // Too big to send inline as a video message — fall back to document
-        return await sendAsDocument(sock, from, msg, session, buffer, watermark, true);
-    }
-
-    await sock.sendMessage(
-        from,
-        {
-            video: buffer,
-            mimetype: 'video/mp4',
-            caption: `🎬 *${session.title}*\n📶 *Quality:* ${session.selectedLabel}\n\n─── *${watermark}* ───`
-        },
-        { quoted: msg }
     );
 }
 
-async function sendAsDocument(sock, from, msg, session, buffer, watermark, autoSwitched = false) {
-    const fileName = `${cleanFileName(session.title)}_${session.selectedLabel.replace(/\s+/g, '')}.mp4`;
+function getActualQualities(info) {
+    const available =
+        getAvailableVideoHeights(info);
 
-    await sock.sendMessage(
-        from,
-        {
-            document: buffer,
-            mimetype: 'video/mp4',
-            fileName,
-            caption:
-                `📄 *${session.title}*\n` +
-                `📶 *Quality:* ${session.selectedLabel}\n` +
-                `📦 *Size:* ${formatBytesDecimal(buffer.length) || 'N/A'}\n` +
-                (autoSwitched ? `⚠️ *100 MB ට වඩා විශාල නිසා Document එකක් ලෙස එවනු ලැබේ.*\n\n` : `\n`) +
-                `─── *${watermark}* ───`
-        },
-        { quoted: msg }
+    return QUALITY_OPTIONS.map(
+        requested =>
+            findNearestQuality(
+                available,
+                requested
+            )
     );
 }
 
-// ============================================================
-// REPLY LISTENER (quoted-message session flow)
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| QUALITY MENU
+|--------------------------------------------------------------------------
+*/
 
-function attachVideoListener(sock) {
-    if (isListenerAttached) return;
-    isListenerAttached = true;
+function buildQualityLines(
+    prefix,
+    actualQualities
+) {
+    return QUALITY_OPTIONS.map(
+        (requested, index) => {
+            const actual =
+                actualQualities[index];
 
-    sock.ev.on('messages.upsert', async (m) => {
-        try {
-            const msg = m.messages[0];
-            if (!msg || !msg.message) return;
-
-            const from = msg.key.remoteJid;
-            const text = (msg.message?.conversation || msg.message?.extendedTextMessage?.text || '').trim();
-
-            const quotedStanzaId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
-            if (!quotedStanzaId) return;
-
-            const session = videoSessions.get(quotedStanzaId);
-            if (!session) return;
-
-            const watermark = session.config?.WATERMARK || 'MrNobody Serenity';
-
-            (async () => {
-                try {
-                    // STEP 1: Selection from search results (1-10)
-                    if (session.step === 'select_search') {
-                        const choice = parseInt(text, 10);
-
-                        if (isNaN(choice) || choice < 1 || choice > session.results.length) {
-                            return await sock.sendMessage(
-                                from,
-                                { text: `⚠️ *කරුණාකර 1 සිට ${session.results.length} දක්වා අංකයක් Reply කරන්න!*` },
-                                { quoted: msg }
-                            );
-                        }
-
-                        const selected = session.results[choice - 1];
-                        videoSessions.delete(quotedStanzaId);
-                        await presentQualities(sock, from, msg, selected.url, selected, session.config, watermark);
-                        return;
-                    }
-
-                    // STEP 2: Quality selection (1.x = video, 2.x = document)
-                    if (session.step === 'select_quality') {
-                        const match = text.match(choiceRegex);
-
-                        if (!match) {
-                            return await sock.sendMessage(
-                                from,
-                                { text: `⚠️ *කරුණාකර 1.1, 1.2... (Video) හෝ 2.1, 2.2... (Document) විදිහට Reply කරන්න!*` },
-                                { quoted: msg }
-                            );
-                        }
-
-                        const mode = match[1]; // '1' video, '2' document
-                        const idx = parseInt(match[2], 10) - 1;
-                        const quality = session.qualities[idx];
-
-                        if (!quality) {
-                            return await sock.sendMessage(
-                                from,
-                                { text: `⚠️ *එම Quality එක නොපවතී. ලැයිස්තුවේ ඇති අංකයක් Reply කරන්න.*` },
-                                { quoted: msg }
-                            );
-                        }
-
-                        const sentMsg = await sock.sendMessage(
-                            from,
-                            { text: `⏳ *${quality.label} Download කරමින්... මඳක් රැඳී සිටින්න.*` },
-                            { quoted: msg }
-                        );
-
-                        let buffer = null;
-                        let debugNotes = [];
-                        try {
-                            const result = await downloadQuality(session.videoUrl, quality);
-                            buffer = result.buffer;
-                            debugNotes = result.notes;
-                        } catch (e) {
-                            debugNotes.push(`unexpected: ${e.message}`);
-                            console.log('[VIDEO] Download Error:', e.message);
-                        }
-
-                        if (!buffer) {
-                            videoSessions.delete(quotedStanzaId);
-                            return await sock.sendMessage(
-                                from,
-                                {
-                                    text:
-                                        `❌ *${quality.label} Download කරගැනීමට නොහැකි විය.*\n` +
-                                        `වෙනත් Quality එකක් උත්සාහ කරන්න.\n\n` +
-                                        `🔧 *Debug (temporary):*\n${debugNotes.map(n => `• ${n}`).join('\n') || 'no details captured'}\n\n` +
-                                        `─── *${watermark}* ───`
-                                },
-                                { quoted: sentMsg }
-                            );
-                        }
-
-                        if (buffer.length > DOCUMENT_LIMIT) {
-                            videoSessions.delete(quotedStanzaId);
-                            return await sock.sendMessage(
-                                from,
-                                { text: `❌ *File එක ඉතා විශාලයි (${formatBytesDecimal(buffer.length)}). අඩු Quality එකක් උත්සාහ කරන්න.*` },
-                                { quoted: sentMsg }
-                            );
-                        }
-
-                        session.selectedLabel = quality.label;
-
-                        if (mode === '1') {
-                            await sendAsVideo(sock, from, sentMsg, session, buffer, watermark);
-                        } else {
-                            await sendAsDocument(sock, from, sentMsg, session, buffer, watermark);
-                        }
-
-                        videoSessions.delete(quotedStanzaId);
-                    }
-                } catch (err) {
-                    console.error('Video interactive listener error:', err);
-                }
-            })();
-        } catch (err) {
-            console.error('Video listener error:', err);
-        }
-    });
-}
-
-async function presentQualities(sock, from, msg, videoUrl, meta, config, watermark) {
-    const title = getTitle(meta);
-    const duration = getDuration(meta);
-    const views = getViews(meta);
-    const channel = getChannelName(meta);
-    const thumbnail = getThumbnail(meta);
-
-    const loadingMsg = await sock.sendMessage(
-        from,
-        { text: `🔎 *Available Qualities සොයමින්...*` },
-        { quoted: msg }
-    );
-
-    const qualities = await getQualities(videoUrl);
-
-    const card = buildQualityCard({ title, duration, views, channel, url: videoUrl, qualities, watermark });
-
-    let sentMsg;
-    if (thumbnail) {
-        sentMsg = await sock.sendMessage(from, { image: { url: thumbnail }, caption: card }, { quoted: loadingMsg });
-    } else {
-        sentMsg = await sock.sendMessage(from, { text: card }, { quoted: loadingMsg });
-    }
-
-    videoSessions.set(sentMsg.key.id, {
-        step: 'select_quality',
-        videoUrl,
-        title,
-        qualities,
-        config,
-        timestamp: Date.now()
-    });
-}
-
-// ============================================================
-// COMMAND
-// ============================================================
-
-export default {
-    pattern: 'video',
-    alias: ['mp4', 'ytmp4', 'ytv', 'videodl'],
-    category: 'download',
-    desc: 'Download YouTube Video — quality selection up to 4K (Video/Document)',
-
-    function: async (sock, msg, { from, args, config }) => {
-        try {
-            attachVideoListener(sock);
-
-            const watermark = config.WATERMARK || 'MrNobody Serenity';
-            const query = args.join(' ');
-
-            if (!query) {
-                return await sock.sendMessage(
-                    from,
-                    {
-                        text:
-                            `⚠️ *කරුණාකර සෙවීමට නමක් හෝ YouTube Link එකක් ලබාදෙන්න!*\n\n` +
-                            `(උදා: \`.video Raghunandana\`)\n\n` +
-                            `─── *${watermark}* ───`
-                    },
-                    { quoted: msg }
+            if (!actual) {
+                return (
+                    `${prefix}.${index + 1} ` +
+                    `${requested}p ❌`
                 );
             }
 
-            const isUrl = ytUrlRegex.test(query);
+            if (actual === requested) {
+                return (
+                    `${prefix}.${index + 1} ` +
+                    `${requested}p`
+                );
+            }
 
-            if (isUrl) {
-                let meta = null;
+            return (
+                `${prefix}.${index + 1} ` +
+                `${requested}p → ${actual}p`
+            );
+        }
+    ).join('\n');
+}
 
-                try {
-                    meta = await yt.metadata(query);
-                } catch (e) {
-                    try {
-                        const searchRes = await yts(query);
-                        meta = searchRes.videos?.[0];
-                    } catch (searchError) {
-                        console.error('Metadata fallback Error:', searchError);
-                    }
+function buildQualityMenu(
+    info,
+    actualQualities,
+    watermark
+) {
+    const title =
+        cleanFileName(info?.title);
+
+    return (
+        `🎬 *MRNOBODY VIDEO DOWNLOADER* 🎬\n\n` +
+
+        `📌 *Title:* ${title}\n` +
+
+        `📺 *Channel:* ${
+            info?.uploader ||
+            info?.channel ||
+            'N/A'
+        }\n` +
+
+        `⏱️ *Duration:* ${
+            formatDuration(
+                info?.duration
+            )
+        }\n\n` +
+
+        `🎥 *VIDEO*\n` +
+
+        `${buildQualityLines(
+            '1',
+            actualQualities
+        )}\n\n` +
+
+        `📄 *DOCUMENT*\n` +
+
+        `${buildQualityLines(
+            '2',
+            actualQualities
+        )}\n\n` +
+
+        `📦 *80 MB ඉක්මවා ගියොත් automatically Document ලෙස යවයි.*\n` +
+
+        `🔄 *අදාළ number එක මේ message එකට Reply කරන්න.*\n\n` +
+
+        `─── *${watermark}* ───`
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| SEARCH RESULTS
+|--------------------------------------------------------------------------
+*/
+
+function buildSearchResults(
+    results,
+    watermark
+) {
+    let text =
+        `🔍 *YOUTUBE VIDEO RESULTS* 🔍\n\n`;
+
+    results.forEach((video, index) => {
+        const views =
+            Number(video.views || 0);
+
+        text +=
+            `*${index + 1}.* ` +
+            `${video.title}\n`;
+
+        text +=
+            `📺 ${
+                video.author?.name ||
+                'N/A'
+            }\n`;
+
+        text +=
+            `⏱️ ${
+                video.timestamp ||
+                'N/A'
+            }  •  👁️ ${
+                views.toLocaleString(
+                    'en-US'
+                )
+            } views\n`;
+
+        text +=
+            `🔗 ${video.url}\n\n`;
+    });
+
+    text +=
+        `👉 *1-${results.length} අතර අංකයක් Reply කරන්න.*\n\n`;
+
+    text +=
+        `─── *${watermark}* ───`;
+
+    return text;
+}
+
+/*
+|--------------------------------------------------------------------------
+| YT-DLP
+|--------------------------------------------------------------------------
+*/
+
+async function runYtDlp(
+    url,
+    options,
+    timeout
+) {
+    const runtime =
+        process.env.YTDLP_JS_RUNTIMES ||
+        'node';
+
+    const finalOptions = {
+        noWarnings: true,
+        noPlaylist: true,
+
+        ...options,
+
+        ...(runtime
+            ? {
+                  jsRuntimes: runtime
+              }
+            : {})
+    };
+
+    /*
+     * Optional cookies.
+     *
+     * If YTDLP_COOKIES is configured,
+     * yt-dlp will use it.
+     */
+    if (process.env.YTDLP_COOKIES) {
+        finalOptions.cookies =
+            process.env.YTDLP_COOKIES;
+    }
+
+    if (process.env.YTDLP_PROXY) {
+        finalOptions.proxy =
+            process.env.YTDLP_PROXY;
+    }
+
+    if (
+        process.env.YTDLP_USER_AGENT
+    ) {
+        finalOptions.userAgent =
+            process.env.YTDLP_USER_AGENT;
+    }
+
+    return youtubedl(
+        url,
+        finalOptions,
+        {
+            timeout:
+                timeout ||
+                60 * 1000,
+
+            maxBuffer:
+                32 * 1024 * 1024
+        }
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| VIDEO INFO
+|--------------------------------------------------------------------------
+*/
+
+async function getVideoInfo(url) {
+    return runYtDlp(
+        url,
+        {
+            dumpSingleJson: true,
+            skipDownload: true,
+            format: 'bestvideo/best'
+        },
+        90 * 1000
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| FORMAT SELECTOR
+|--------------------------------------------------------------------------
+*/
+
+function buildFormatSelector(
+    info,
+    actualHeight
+) {
+    const formats =
+        getFormats(info);
+
+    /*
+     * First look for a progressive format
+     * that already contains audio.
+     */
+    const progressiveFormats =
+        formats
+            .filter(format => {
+                return (
+                    format?.vcodec &&
+                    format.vcodec !==
+                        'none' &&
+                    format?.acodec &&
+                    format.acodec !==
+                        'none' &&
+                    Number(
+                        format.height
+                    ) === actualHeight
+                );
+            })
+            .sort((a, b) => {
+                const aBitrate =
+                    Number(
+                        a.tbr || 0
+                    );
+
+                const bBitrate =
+                    Number(
+                        b.tbr || 0
+                    );
+
+                return (
+                    bBitrate -
+                    aBitrate
+                );
+            });
+
+    if (
+        progressiveFormats.length
+    ) {
+        return String(
+            progressiveFormats[0]
+                .format_id
+        );
+    }
+
+    /*
+     * Otherwise use best video at the
+     * selected real height + best audio.
+     */
+    const videoFormats =
+        formats
+            .filter(format => {
+                return (
+                    format?.vcodec &&
+                    format.vcodec !==
+                        'none' &&
+                    Number(
+                        format.height
+                    ) === actualHeight
+                );
+            })
+            .sort((a, b) => {
+                const aBitrate =
+                    Number(
+                        a.tbr || 0
+                    );
+
+                const bBitrate =
+                    Number(
+                        b.tbr || 0
+                    );
+
+                return (
+                    bBitrate -
+                    aBitrate
+                );
+            });
+
+    if (
+        videoFormats.length &&
+        videoFormats[0]?.format_id
+    ) {
+        return (
+            `${videoFormats[0].format_id}` +
+            `+bestaudio/best`
+        );
+    }
+
+    /*
+     * Final yt-dlp fallback.
+     */
+    return (
+        `bestvideo[height=${actualHeight}]` +
+        `+bestaudio/best[height=${actualHeight}]` +
+        `/best`
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| DOWNLOAD
+|--------------------------------------------------------------------------
+*/
+
+async function downloadVideo(
+    url,
+    info,
+    actualHeight,
+    outputFile
+) {
+    const format =
+        buildFormatSelector(
+            info,
+            actualHeight
+        );
+
+    await runYtDlp(
+        url,
+        {
+            format,
+
+            output: outputFile,
+
+            mergeOutputFormat:
+                'mp4',
+
+            remuxVideo:
+                'mp4',
+
+            noPart: true,
+
+            preferFreeFormats:
+                true,
+
+            restrictFilenames:
+                true,
+
+            retries: 3,
+
+            fragmentRetries: 3,
+
+            concurrentFragments: 4
+        },
+        45 * 60 * 1000
+    );
+
+    /*
+     * yt-dlp normally creates the requested
+     * output path, but verify it before sending.
+     */
+    await fsp.access(outputFile);
+
+    return outputFile;
+}
+
+/*
+|--------------------------------------------------------------------------
+| SEND VIDEO / DOCUMENT
+|--------------------------------------------------------------------------
+*/
+
+async function sendDownloadedVideo(
+    sock,
+    from,
+    msg,
+    filePath,
+    session,
+    mode,
+    requestedQuality,
+    actualQuality
+) {
+    const stat =
+        await fsp.stat(filePath);
+
+    const title =
+        cleanFileName(
+            session.info?.title
+        );
+
+    const fileName =
+        `${title}-${actualQuality}p.mp4`;
+
+    /*
+     * Document mode OR >80 MB
+     * => Document.
+     */
+    const mustUseDocument =
+        mode === 'document' ||
+        stat.size > MAX_FILE_SIZE;
+
+    let caption =
+        `🎬 *${title}*\n\n` +
+
+        `🎚️ Quality: *${actualQuality}p*`;
+
+    if (
+        actualQuality !==
+        requestedQuality
+    ) {
+        caption +=
+            `\n🔄 Requested: *${requestedQuality}p*`;
+    }
+
+    caption +=
+        `\n📦 Size: *${formatBytes(
+            stat.size
+        )}*`;
+
+    if (
+        stat.size >
+        MAX_FILE_SIZE
+    ) {
+        caption +=
+            `\n⚠️ 80 MB limit නිසා Document ලෙස යවන ලදී.`;
+    }
+
+    caption +=
+        `\n\n─── *${session.watermark}* ───`;
+
+    /*
+     * DOCUMENT
+     */
+    if (mustUseDocument) {
+        await sock.sendMessage(
+            from,
+            {
+                document: {
+                    url: filePath
+                },
+
+                mimetype:
+                    'video/mp4',
+
+                fileName,
+
+                caption
+            },
+            {
+                quoted: msg
+            }
+        );
+
+        return;
+    }
+
+    /*
+     * VIDEO
+     */
+    try {
+        await sock.sendMessage(
+            from,
+            {
+                video: {
+                    url: filePath
+                },
+
+                mimetype:
+                    'video/mp4',
+
+                fileName,
+
+                caption
+            },
+            {
+                quoted: msg
+            }
+        );
+    } catch (videoError) {
+        console.error(
+            '[VIDEO] Video send failed, falling back to document:',
+            videoError
+        );
+
+        await sock.sendMessage(
+            from,
+            {
+                document: {
+                    url: filePath
+                },
+
+                mimetype:
+                    'video/mp4',
+
+                fileName,
+
+                caption:
+                    `${caption}\n\n` +
+                    `⚠️ Video ලෙස යැවීමට නොහැකි වූ නිසා Document ලෙස යවන ලදී.`
+            },
+            {
+                quoted: msg
+            }
+        );
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| REPLY LISTENER
+|--------------------------------------------------------------------------
+*/
+
+function attachListener(sock) {
+    const store =
+        getStore(sock);
+
+    if (
+        store.listenerAttached
+    ) {
+        return;
+    }
+
+    store.listenerAttached =
+        true;
+
+    sock.ev.on(
+        'messages.upsert',
+        async event => {
+            try {
+                const msg =
+                    event?.messages?.[0];
+
+                if (
+                    !msg?.message
+                ) {
+                    return;
                 }
 
-                await presentQualities(sock, from, msg, query, meta || {}, config, watermark);
-            } else {
-                const searchRes = await yts(query);
-                const videos = (searchRes.videos || []).slice(0, 10);
+                const quotedId =
+                    getQuotedStanzaId(
+                        msg
+                    );
 
-                if (!videos.length) {
-                    return await sock.sendMessage(
+                if (!quotedId) {
+                    return;
+                }
+
+                const session =
+                    store.get(
+                        quotedId
+                    );
+
+                if (!session) {
+                    return;
+                }
+
+                const text =
+                    getText(msg);
+
+                if (!text) {
+                    return;
+                }
+
+                const from =
+                    msg.key.remoteJid;
+
+                /*
+                 * SEARCH RESULT SELECTION
+                 */
+                if (
+                    session.step ===
+                    'search'
+                ) {
+                    const choice =
+                        Number.parseInt(
+                            text,
+                            10
+                        );
+
+                    if (
+                        !Number.isInteger(
+                            choice
+                        ) ||
+                        choice < 1 ||
+                        choice >
+                            session.results
+                                .length
+                    ) {
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `⚠️ *1 සිට ${session.results.length} දක්වා අංකයක් Reply කරන්න.*`
+                            },
+                            {
+                                quoted: msg
+                            }
+                        );
+
+                        return;
+                    }
+
+                    const selected =
+                        session.results[
+                            choice - 1
+                        ];
+
+                    await sock.sendMessage(
                         from,
-                        { text: '❌ *කිසිදු YouTube ප්‍රතිඵලයක් හමු නොවීය.*' },
-                        { quoted: msg }
+                        {
+                            text:
+                                `🔎 *Video details ලබාගනිමින්...*`
+                        },
+                        {
+                            quoted: msg
+                        }
+                    );
+
+                    const info =
+                        await getVideoInfo(
+                            selected.url
+                        );
+
+                    const actualQualities =
+                        getActualQualities(
+                            info
+                        );
+
+                    if (
+                        !actualQualities.some(
+                            Boolean
+                        )
+                    ) {
+                        throw new Error(
+                            'මෙම video එකේ downloadable quality එකක් හමු නොවීය.'
+                        );
+                    }
+
+                    const sent =
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    buildQualityMenu(
+                                        info,
+                                        actualQualities,
+                                        session.watermark
+                                    )
+                            },
+                            {
+                                quoted: msg
+                            }
+                        );
+
+                    /*
+                     * Remove old search session.
+                     */
+                    store.delete(
+                        quotedId
+                    );
+
+                    /*
+                     * Create quality session.
+                     */
+                    store.set(
+                        sent.key.id,
+                        {
+                            step:
+                                'quality',
+
+                            url:
+                                selected.url,
+
+                            info,
+
+                            actualQualities,
+
+                            watermark:
+                                session.watermark,
+
+                            createdAt:
+                                Date.now()
+                        }
+                    );
+
+                    return;
+                }
+
+                /*
+                 * QUALITY SELECTION
+                 */
+                if (
+                    session.step ===
+                    'quality'
+                ) {
+                    /*
+                     * Accepted:
+                     *
+                     * 1.1
+                     * 1.2
+                     * 1.3
+                     * 1.4
+                     * 1.5
+                     *
+                     * 2.1
+                     * 2.2
+                     * 2.3
+                     * 2.4
+                     * 2.5
+                     */
+                    const match =
+                        text.match(
+                            /^([12])\.([1-5])$/
+                        );
+
+                    if (!match) {
+                        return;
+                    }
+
+                    const mode =
+                        match[1] === '1'
+                            ? 'video'
+                            : 'document';
+
+                    const index =
+                        Number(
+                            match[2]
+                        ) - 1;
+
+                    const requestedQuality =
+                        QUALITY_OPTIONS[
+                            index
+                        ];
+
+                    const actualQuality =
+                        session
+                            .actualQualities[
+                            index
+                        ];
+
+                    if (
+                        !actualQuality
+                    ) {
+                        await sock.sendMessage(
+                            from,
+                            {
+                                text:
+                                    `❌ *${requestedQuality}p quality එක ලබාගත නොහැක.*`
+                            },
+                            {
+                                quoted: msg
+                            }
+                        );
+
+                        return;
+                    }
+
+                    await sock.sendMessage(
+                        from,
+                        {
+                            text:
+                                `⏳ *${actualQuality}p video එක download කරමින්...*\n\n` +
+                                `📌 ${cleanFileName(
+                                    session.info?.title
+                                )}\n` +
+                                `🎚️ Quality: *${actualQuality}p*` +
+                                (
+                                    actualQuality !==
+                                    requestedQuality
+                                        ? `\n🔄 Requested ${requestedQuality}p → Available ${actualQuality}p`
+                                        : ''
+                                ) +
+                                `\n\n📦 80 MB ඉක්මවා ගියොත් Document ලෙස යවනු ලැබේ.`
+                        },
+                        {
+                            quoted: msg
+                        }
+                    );
+
+                    /*
+                     * Unique temporary directory.
+                     */
+                    const tempDir =
+                        await fsp.mkdtemp(
+                            path.join(
+                                os.tmpdir(),
+                                'mrnobody-video-'
+                            )
+                        );
+
+                    const outputFile =
+                        path.join(
+                            tempDir,
+                            'video.mp4'
+                        );
+
+                    try {
+                        await downloadVideo(
+                            session.url,
+                            session.info,
+                            actualQuality,
+                            outputFile
+                        );
+
+                        await sendDownloadedVideo(
+                            sock,
+                            from,
+                            msg,
+                            outputFile,
+                            session,
+                            mode,
+                            requestedQuality,
+                            actualQuality
+                        );
+                    } finally {
+                        await fsp.rm(
+                            tempDir,
+                            {
+                                recursive:
+                                    true,
+                                force:
+                                    true
+                            }
+                        ).catch(
+                            () => {}
+                        );
+
+                        store.delete(
+                            quotedId
+                        );
+                    }
+                }
+            } catch (error) {
+                console.error(
+                    '[VIDEO] Reply handler error:',
+                    error
+                );
+
+                const from =
+                    msg?.key?.remoteJid;
+
+                if (!from) {
+                    return;
+                }
+
+                await sock.sendMessage(
+                    from,
+                    {
+                        text:
+                            `❌ *Video download error!*\n\n` +
+                            `${error?.message || 'Unknown error'}`
+                    },
+                    {
+                        quoted: msg
+                    }
+                ).catch(
+                    () => {}
+                );
+            }
+        }
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| MAIN COMMAND
+|--------------------------------------------------------------------------
+*/
+
+export default {
+    pattern: 'video',
+
+    alias: [
+        'ytvideo',
+        'ytv',
+        'ytmp4'
+    ],
+
+    category: 'download',
+
+    desc:
+        'YouTube video downloader with quality selection',
+
+    function: async (
+        sock,
+        msg,
+        {
+            from,
+            args,
+            config
+        }
+    ) => {
+        const watermark =
+            config?.WATERMARK ||
+            'MrNobody Serenity';
+
+        const input =
+            args.join(' ').trim();
+
+        /*
+         * Make sure reply listener exists
+         * for this WhatsApp socket.
+         */
+        attachListener(sock);
+
+        /*
+         * NO INPUT
+         */
+        if (!input) {
+            return sock.sendMessage(
+                from,
+                {
+                    text:
+                        `🎬 *YOUTUBE VIDEO DOWNLOADER*\n\n` +
+
+                        `🔎 Search:\n` +
+                        `*.video Alan Walker Faded*\n\n` +
+
+                        `🔗 Direct URL:\n` +
+                        `*.video https://youtu.be/VIDEO_ID*\n\n` +
+
+                        `🎥 1.1 - 1.5 = Video\n` +
+                        `📄 2.1 - 2.5 = Document\n\n` +
+
+                        `144p / 360p / 480p / 720p / 1080p\n\n` +
+
+                        `─── *${watermark}* ───`
+                },
+                {
+                    quoted: msg
+                }
+            );
+        }
+
+        const store =
+            getStore(sock);
+
+        try {
+            /*
+             * DIRECT URL
+             */
+            if (
+                isYouTubeUrl(input)
+            ) {
+                const url =
+                    cleanYouTubeUrl(
+                        input
+                    );
+
+                await sock.sendMessage(
+                    from,
+                    {
+                        text:
+                            `🔎 *YouTube video එක check කරමින්...*`
+                    },
+                    {
+                        quoted: msg
+                    }
+                );
+
+                const info =
+                    await getVideoInfo(
+                        url
+                    );
+
+                const actualQualities =
+                    getActualQualities(
+                        info
+                    );
+
+                if (
+                    !actualQualities.some(
+                        Boolean
+                    )
+                ) {
+                    throw new Error(
+                        'මෙම video එකේ downloadable quality එකක් හමු නොවීය.'
                     );
                 }
 
-                const searchListText = buildSearchList(videos, watermark);
-                const sentMsg = await sock.sendMessage(from, { text: searchListText }, { quoted: msg });
+                const sent =
+                    await sock.sendMessage(
+                        from,
+                        {
+                            text:
+                                buildQualityMenu(
+                                    info,
+                                    actualQualities,
+                                    watermark
+                                )
+                        },
+                        {
+                            quoted: msg
+                        }
+                    );
 
-                videoSessions.set(sentMsg.key.id, {
-                    step: 'select_search',
-                    results: videos,
-                    config,
-                    timestamp: Date.now()
-                });
+                store.set(
+                    sent.key.id,
+                    {
+                        step:
+                            'quality',
+
+                        url,
+
+                        info,
+
+                        actualQualities,
+
+                        watermark,
+
+                        createdAt:
+                            Date.now()
+                    }
+                );
+
+                return;
             }
-        } catch (error) {
-            console.error('Video Command Error:', error);
+
+            /*
+             * SEARCH
+             */
             await sock.sendMessage(
                 from,
-                { text: '❌ Video command එක අතරතුර දෝෂයක් සිදු විය.' },
-                { quoted: msg }
+                {
+                    text:
+                        `🔍 *YouTube search කරමින්...*\n\n` +
+                        `📌 ${input}`
+                },
+                {
+                    quoted: msg
+                }
+            );
+
+            const search =
+                await yts(input);
+
+            const results =
+                (
+                    search?.videos ||
+                    []
+                ).slice(
+                    0,
+                    MAX_RESULTS
+                );
+
+            if (
+                !results.length
+            ) {
+                return sock.sendMessage(
+                    from,
+                    {
+                        text:
+                            `❌ *YouTube search result එකක් හමු නොවීය.*`
+                    },
+                    {
+                        quoted: msg
+                    }
+                );
+            }
+
+            const sent =
+                await sock.sendMessage(
+                    from,
+                    {
+                        text:
+                            buildSearchResults(
+                                results,
+                                watermark
+                            )
+                    },
+                    {
+                        quoted: msg
+                    }
+                );
+
+            store.set(
+                sent.key.id,
+                {
+                    step:
+                        'search',
+
+                    results,
+
+                    watermark,
+
+                    createdAt:
+                        Date.now()
+                }
+            );
+        } catch (error) {
+            console.error(
+                '[VIDEO] Command error:',
+                error
+            );
+
+            await sock.sendMessage(
+                from,
+                {
+                    text:
+                        `❌ *YouTube video ලබාගැනීමට නොහැකි විය.*\n\n` +
+                        `${error?.message || 'Unknown error'}`
+                },
+                {
+                    quoted: msg
+                }
+            ).catch(
+                () => {}
             );
         }
     }
