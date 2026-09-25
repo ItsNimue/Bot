@@ -161,7 +161,7 @@ async function getQualitiesViaYtdlp(url) {
 
         return qualities.length ? qualities : null;
     } catch (err) {
-        console.error('ytdlp-nodejs quality detection failed, using fallback ladder:', err.message);
+        console.log('[VIDEO] ytdlp-nodejs quality detection failed, using fallback ladder:', err.message);
         return null;
     }
 }
@@ -214,6 +214,8 @@ async function downloadWithYtdlp(url, quality) {
 }
 
 async function downloadWithScraper(url, quality) {
+    const notes = [];
+
     // Tier 2: @vreden/youtube_scraper (same package song.js already uses)
     try {
         const res = await yt.ytmp4(url, quality.height);
@@ -225,16 +227,20 @@ async function downloadWithScraper(url, quality) {
                 maxContentLength: Infinity,
                 maxBodyLength: Infinity
             });
-            return Buffer.from(response.data);
+            console.log(`[VIDEO] Tier2 (vreden scraper) success for ${quality.height}p`);
+            return { buffer: Buffer.from(response.data), notes };
         }
+        notes.push(`vreden-scraper: no download url (${JSON.stringify(res).slice(0, 150)})`);
     } catch (e) {
-        console.error('Vreden ytmp4 Error:', e.message);
+        notes.push(`vreden-scraper: ${e.message}`);
+        console.log('[VIDEO] Vreden ytmp4 Error:', e.message);
     }
 
     // Tier 3: direct public API fallback
     try {
         const fallback = await axios.get(
-            `https://api.vreden.my.id/api/ytmp4?url=${encodeURIComponent(url)}&quality=${quality.height}`
+            `https://api.vreden.my.id/api/ytmp4?url=${encodeURIComponent(url)}&quality=${quality.height}`,
+            { timeout: 30000 }
         );
         const downloadUrl = extractDownloadUrl(fallback.data);
 
@@ -244,13 +250,16 @@ async function downloadWithScraper(url, quality) {
                 maxContentLength: Infinity,
                 maxBodyLength: Infinity
             });
-            return Buffer.from(response.data);
+            console.log(`[VIDEO] Tier3 (vreden api) success for ${quality.height}p`);
+            return { buffer: Buffer.from(response.data), notes };
         }
+        notes.push(`vreden-api: no download url (${JSON.stringify(fallback.data).slice(0, 150)})`);
     } catch (e) {
-        console.error('Vreden API Fallback Error:', e.message);
+        notes.push(`vreden-api: ${e.message}`);
+        console.log('[VIDEO] Vreden API Fallback Error:', e.message);
     }
 
-    return null;
+    return { buffer: null, notes };
 }
 
 async function downloadQuality(url, quality) {
