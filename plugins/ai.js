@@ -14,17 +14,39 @@ const MAX_MESSAGE_CHARS = 12000;
 const MAX_REPLY_CHARS = 6000;
 const MAX_SYSTEM_PROMPT_CHARS = 3000;
 
+/*
+ * Gemini models
+ */
+
 const DEFAULT_MODEL =
     process.env.AI_MODEL || 'gemini-3.5-flash-lite';
+
+const IMAGE_MODEL =
+    process.env.AI_IMAGE_MODEL || 'gemini-3.1-flash-image';
 
 const AI_API_URL = (
     process.env.AI_API_URL ||
     'https://generativelanguage.googleapis.com/v1beta/models'
 ).replace(/\/+$/, '');
 
+/*
+ * Gemini inline media should be kept reasonably small.
+ * Video inline input is documented for requests under 20MB.
+ */
+
+const MAX_INLINE_MEDIA_BYTES =
+    18 * 1024 * 1024;
+
+const MAX_MEDIA_DOWNLOAD_BYTES =
+    25 * 1024 * 1024;
+
 const sessionStates = new Map();
 const patchedManagers = new WeakSet();
 
+
+/* =========================================================
+ * SESSION STATE
+ * ========================================================= */
 
 function getSessionState(sessionId) {
     let state = sessionStates.get(sessionId);
@@ -43,14 +65,129 @@ function getSessionState(sessionId) {
 }
 
 
+/* =========================================================
+ * MESSAGE HELPERS
+ * ========================================================= */
+
+function unwrapMessage(message) {
+    let current = message;
+
+    for (let i = 0; i < 5; i++) {
+        if (!current) {
+            break;
+        }
+
+        if (current.ephemeralMessage?.message) {
+            current = current.ephemeralMessage.message;
+            continue;
+        }
+
+        if (current.viewOnceMessage?.message) {
+            current = current.viewOnceMessage.message;
+            continue;
+        }
+
+        if (current.viewOnceMessageV2?.message) {
+            current = current.viewOnceMessageV2.message;
+            continue;
+        }
+
+        if (current.viewOnceMessageV2Extension?.message) {
+            current = current.viewOnceMessageV2Extension.message;
+            continue;
+        }
+
+        break;
+    }
+
+    return current || message;
+}
+
+
+function getMessageContent(msg) {
+    return unwrapMessage(
+        msg?.message || {}
+    );
+}
+
+
 function getText(msg) {
+    const message =
+        getMessageContent(msg);
+
     return (
-        msg?.message?.conversation ||
-        msg?.message?.extendedTextMessage?.text ||
-        msg?.message?.imageMessage?.caption ||
-        msg?.message?.videoMessage?.caption ||
+        message?.conversation ||
+        message?.extendedTextMessage?.text ||
+        message?.imageMessage?.caption ||
+        message?.videoMessage?.caption ||
+        message?.documentMessage?.caption ||
+        message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
         ''
     ).trim();
+}
+
+
+function getMediaInfo(msg) {
+    const message =
+        getMessageContent(msg);
+
+    if (message?.imageMessage) {
+        return {
+            type: 'image',
+            message: message.imageMessage,
+            mimeType:
+                message.imageMessage.mimetype ||
+                'image/jpeg'
+        };
+    }
+
+    if (message?.videoMessage) {
+        return {
+            type: 'video',
+            message: message.videoMessage,
+            mimeType:
+                message.videoMessage.mimetype ||
+                'video/mp4'
+        };
+    }
+
+    if (message?.audioMessage) {
+        return {
+            type: 'audio',
+            message: message.audioMessage,
+            mimeType:
+                message.audioMessage.mimetype ||
+                'audio/ogg'
+        };
+    }
+
+    if (message?.documentMessage) {
+        const mime =
+            message.documentMessage.mimetype || '';
+
+        if (
+            mime.startsWith('image/') ||
+            mime.startsWith('video/') ||
+            mime.startsWith('audio/')
+        ) {
+            return {
+                type:
+                    mime.startsWith('image/')
+                        ? 'image'
+                        : mime.startsWith('video/')
+                            ? 'video'
+                            : 'audio',
+
+                message:
+                    message.documentMessage,
+
+                mimeType:
+                    mime
+            };
+        }
+    }
+
+    return null;
 }
 
 
@@ -72,10 +209,16 @@ function getSender(msg, from) {
 }
 
 
-function getChat(sessionId, chatId) {
-    const state = getSessionState(sessionId);
+/* =========================================================
+ * CHAT STATE
+ * ========================================================= */
 
-    let chat = state.chats.get(chatId);
+function getChat(sessionId, chatId) {
+    const state =
+        getSessionState(sessionId);
+
+    let chat =
+        state.chats.get(chatId);
 
     if (!chat) {
         chat = {
@@ -87,7 +230,10 @@ function getChat(sessionId, chatId) {
             queue: Promise.resolve()
         };
 
-        state.chats.set(chatId, chat);
+        state.chats.set(
+            chatId,
+            chat
+        );
     }
 
     return chat;
@@ -95,22 +241,34 @@ function getChat(sessionId, chatId) {
 
 
 async function loadState(sessionId) {
-    const state = getSessionState(sessionId);
+    const state =
+        getSessionState(sessionId);
 
     if (state.loading) {
         return state.loading;
     }
 
     state.loading = (async () => {
-        const settings = await getSettings(sessionId);
+        const settings =
+            await getSettings(sessionId);
 
-        const modes = settings.aiModeChats || {};
-        const histories = settings.aiHistories || {};
+        const modes =
+            settings.aiModeChats || {};
+
+        const histories =
+            settings.aiHistories || {};
 
         state.chats.clear();
 
-        for (const [chatId, raw] of Object.entries(modes)) {
-            const chat = getChat(sessionId, chatId);
+        for (
+            const [chatId, raw]
+            of Object.entries(modes)
+        ) {
+            const chat =
+                getChat(
+                    sessionId,
+                    chatId
+                );
 
             chat.enabled =
                 raw?.enabled === true;
@@ -119,7 +277,8 @@ async function loadState(sessionId) {
                 raw?.memory !== false;
 
             chat.model =
-                raw?.model || DEFAULT_MODEL;
+                raw?.model ||
+                DEFAULT_MODEL;
 
             chat.systemPrompt =
                 String(
@@ -130,7 +289,9 @@ async function loadState(sessionId) {
                 );
 
             chat.history =
-                Array.isArray(histories[chatId])
+                Array.isArray(
+                    histories[chatId]
+                )
                     ? histories[chatId].slice(
                         -MAX_HISTORY_MESSAGES
                     )
@@ -144,9 +305,15 @@ async function loadState(sessionId) {
 }
 
 
-async function saveChat(sessionId, chatId) {
+async function saveChat(
+    sessionId,
+    chatId
+) {
     const chat =
-        getChat(sessionId, chatId);
+        getChat(
+            sessionId,
+            chatId
+        );
 
     const settings =
         await getSettings(sessionId);
@@ -167,7 +334,8 @@ async function saveChat(sessionId, chatId) {
             chat.memory !== false,
 
         model:
-            chat.model || DEFAULT_MODEL,
+            chat.model ||
+            DEFAULT_MODEL,
 
         systemPrompt:
             String(
@@ -231,21 +399,255 @@ async function clearChatHistory(
 
 
 /* =========================================================
- * GEMINI API
+ * MEDIA DOWNLOAD
  * ========================================================= */
 
-async function askAI({
-    apiKey,
-    model,
-    systemPrompt,
-    history,
-    userText
-}) {
-    const contents = [];
+async function downloadWhatsAppMedia(
+    sock,
+    msg
+) {
+    /*
+     * Prefer Baileys downloadMediaMessage.
+     * It is dynamically imported so this plugin remains
+     * self-contained.
+     */
+
+    try {
+        const baileys =
+            await import(
+                '@whiskeysockets/baileys'
+            );
+
+        if (
+            typeof baileys.downloadMediaMessage ===
+            'function'
+        ) {
+            const buffer =
+                await baileys.downloadMediaMessage(
+                    msg,
+                    'buffer',
+                    {},
+                    {
+                        logger: undefined,
+                        reuploadRequest:
+                            sock?.updateMediaMessage
+                                ? sock.updateMediaMessage.bind(sock)
+                                : undefined
+                    }
+                );
+
+            if (Buffer.isBuffer(buffer)) {
+                return buffer;
+            }
+
+            if (buffer) {
+                return Buffer.from(buffer);
+            }
+        }
+    } catch (err) {
+        console.error(
+            'AI media download via Baileys failed:',
+            err?.message || err
+        );
+    }
+
 
     /*
-     * Previous conversation
+     * Some WhatsApp wrappers expose the method directly
+     * on the socket.
      */
+
+    if (
+        typeof sock?.downloadMediaMessage ===
+        'function'
+    ) {
+        const buffer =
+            await sock.downloadMediaMessage(
+                msg
+            );
+
+        if (Buffer.isBuffer(buffer)) {
+            return buffer;
+        }
+
+        if (buffer) {
+            return Buffer.from(buffer);
+        }
+    }
+
+
+    throw new Error(
+        'Could not download WhatsApp media.'
+    );
+}
+
+
+/* =========================================================
+ * MEDIA SAFETY
+ * ========================================================= */
+
+function validateMediaSize(
+    buffer,
+    mediaInfo
+) {
+    if (!buffer) {
+        throw new Error(
+            'Media download returned empty data.'
+        );
+    }
+
+    const size =
+        buffer.length;
+
+    if (
+        size >
+        MAX_INLINE_MEDIA_BYTES
+    ) {
+        throw new Error(
+            `${mediaInfo.type} is too large for inline Gemini processing. Please send a smaller file (under 18MB).`
+        );
+    }
+
+    if (
+        size >
+        MAX_MEDIA_DOWNLOAD_BYTES
+    ) {
+        throw new Error(
+            'Media file is too large.'
+        );
+    }
+}
+
+
+/* =========================================================
+ * IMAGE GENERATION DETECTION
+ * ========================================================= */
+
+function isImageGenerationRequest(
+    text,
+    hasImage
+) {
+    const value =
+        String(text || '')
+            .toLowerCase()
+            .trim();
+
+    if (!value) {
+        return false;
+    }
+
+
+    /*
+     * English
+     */
+
+    const englishPatterns = [
+        /\bgenerate\b.*\bimage\b/,
+        /\bgenerate\b.*\bpicture\b/,
+        /\bcreate\b.*\bimage\b/,
+        /\bcreate\b.*\bpicture\b/,
+        /\bmake\b.*\bimage\b/,
+        /\bmake\b.*\bpicture\b/,
+        /\bdraw\b/,
+        /\bpaint\b/,
+        /\bdesign\b.*\bimage\b/,
+        /\bcreate\b.*\bart\b/,
+        /\bgenerate\b.*\bart\b/,
+        /\bturn\b.*\binto\b.*\bimage\b/,
+        /\bedit\b.*\bimage\b/,
+        /\bedit\b.*\bphoto\b/,
+        /\bmodify\b.*\bimage\b/,
+        /\btransform\b.*\bimage\b/,
+        /\bchange\b.*\bbackground\b/
+    ];
+
+    if (
+        englishPatterns.some(
+            pattern =>
+                pattern.test(value)
+        )
+    ) {
+        return true;
+    }
+
+
+    /*
+     * Sinhala / Singlish patterns
+     */
+
+    const sinhalaPatterns = [
+        /පින්තූරයක්.*හද/,
+        /පින්තූර.*හද/,
+        /image.*හද/,
+        /image.*කර/,
+        /photo.*හද/,
+        /photo.*කර/,
+        /පින්තූරයක්.*දෙන්න/,
+        /පින්තූර.*දෙන්න/,
+        /රූපයක්.*හද/,
+        /රූප.*හද/,
+        /generate.*කර/,
+        /create.*කර/,
+        /draw.*කර/,
+        /background.*change.*කර/
+    ];
+
+    if (
+        sinhalaPatterns.some(
+            pattern =>
+                pattern.test(value)
+        )
+    ) {
+        return true;
+    }
+
+
+    /*
+     * If an image was supplied and the user clearly
+     * asks for an edit/change, generate an image.
+     */
+
+    if (hasImage) {
+        const editPatterns = [
+            /\bedit\b/,
+            /\bmodify\b/,
+            /\bchange\b/,
+            /\bremove\b/,
+            /\badd\b/,
+            /\breplace\b/,
+            /\btransform\b/,
+            /\bmake\b/,
+            /\bturn\b/,
+            /වෙනස්/,
+            /මාරු/,
+            /අයින්/,
+            /දාන්න/,
+            /එකතු/
+        ];
+
+        if (
+            editPatterns.some(
+                pattern =>
+                    pattern.test(value)
+            )
+        ) {
+            return true;
+        }
+    }
+
+
+    return false;
+}
+
+
+/* =========================================================
+ * GEMINI CONTENT PARTS
+ * ========================================================= */
+
+function historyToContents(
+    history
+) {
+    const contents = [];
 
     for (
         const item of
@@ -258,7 +660,9 @@ async function askAI({
             ![
                 'user',
                 'assistant'
-            ].includes(item.role) ||
+            ].includes(
+                item.role
+            ) ||
             !item.text
         ) {
             continue;
@@ -281,25 +685,97 @@ async function askAI({
         });
     }
 
+    return contents;
+}
+
+
+/* =========================================================
+ * GEMINI TEXT / MULTIMODAL REQUEST
+ * ========================================================= */
+
+async function askAI({
+    apiKey,
+    model,
+    systemPrompt,
+    history,
+    userText,
+    media
+}) {
+    const contents =
+        historyToContents(
+            history
+        );
+
+
+    const currentParts = [];
+
 
     /*
-     * Current user message
+     * Media first.
      */
 
-    contents.push({
-        role: 'user',
+    if (media?.buffer) {
+        currentParts.push({
+            inlineData: {
+                mimeType:
+                    media.mimeType,
 
-        parts: [
-            {
-                text: userText
+                data:
+                    media.buffer.toString(
+                        'base64'
+                    )
             }
-        ]
+        });
+    }
+
+
+    /*
+     * Current text.
+     */
+
+    let prompt =
+        String(
+            userText || ''
+        ).trim();
+
+
+    if (!prompt) {
+        if (
+            media?.type === 'image'
+        ) {
+            prompt =
+                'Analyze this image carefully and describe what you see. Answer naturally and helpfully.';
+        } else if (
+            media?.type === 'video'
+        ) {
+            prompt =
+                'Analyze this video carefully and explain what happens in it. Answer naturally and helpfully.';
+        } else if (
+            media?.type === 'audio'
+        ) {
+            prompt =
+                'Listen to this audio carefully, understand what is being said, and respond naturally to it.';
+        } else {
+            prompt =
+                'Respond naturally and helpfully.';
+        }
+    }
+
+
+    currentParts.push({
+        text:
+            prompt.slice(
+                0,
+                MAX_MESSAGE_CHARS
+            )
     });
 
 
-    /*
-     * Gemini request body
-     */
+    contents.push({
+        role: 'user',
+        parts: currentParts
+    });
+
 
     const body = {
         contents
@@ -325,7 +801,8 @@ async function askAI({
 
 
     const selectedModel =
-        model || DEFAULT_MODEL;
+        model ||
+        DEFAULT_MODEL;
 
 
     const response =
@@ -343,17 +820,22 @@ async function askAI({
                         'application/json'
                 },
 
-                timeout: 60000,
+                timeout:
+                    media?.type === 'video'
+                        ? 120000
+                        : 60000,
+
+                maxContentLength:
+                    Infinity,
+
+                maxBodyLength:
+                    Infinity,
 
                 validateStatus:
                     () => true
             }
         );
 
-
-    /*
-     * API error
-     */
 
     if (
         response.status < 200 ||
@@ -372,18 +854,21 @@ async function askAI({
     }
 
 
-    /*
-     * Extract response text
-     */
-
     const candidates =
-        response.data?.candidates || [];
+        response.data?.candidates ||
+        [];
 
     const parts =
-        candidates?.[0]?.content?.parts || [];
+        candidates?.[0]?.content?.parts ||
+        [];
+
 
     const answer =
         parts
+            .filter(
+                part =>
+                    !part?.thought
+            )
             .map(
                 part =>
                     part?.text || ''
@@ -404,15 +889,270 @@ async function askAI({
     }
 
 
-    return answer.slice(
-        0,
-        MAX_REPLY_CHARS
-    );
+    return {
+        text:
+            answer.slice(
+                0,
+                MAX_REPLY_CHARS
+            ),
+
+        image:
+            null
+    };
 }
 
 
 /* =========================================================
- * SEND REPLY
+ * GEMINI IMAGE GENERATION
+ * ========================================================= */
+
+async function generateImage({
+    apiKey,
+    systemPrompt,
+    history,
+    userText,
+    media
+}) {
+    const contents = [];
+
+
+    /*
+     * Keep text history, but avoid sending too much.
+     */
+
+    for (
+        const item of
+        history.slice(
+            -8
+        )
+    ) {
+        if (
+            !item ||
+            !item.text ||
+            ![
+                'user',
+                'assistant'
+            ].includes(
+                item.role
+            )
+        ) {
+            continue;
+        }
+
+        contents.push({
+            role:
+                item.role === 'assistant'
+                    ? 'model'
+                    : 'user',
+
+            parts: [
+                {
+                    text:
+                        String(
+                            item.text
+                        )
+                }
+            ]
+        });
+    }
+
+
+    const currentParts = [];
+
+
+    /*
+     * Existing image for image editing.
+     */
+
+    if (
+        media?.type === 'image' &&
+        media?.buffer
+    ) {
+        currentParts.push({
+            inlineData: {
+                mimeType:
+                    media.mimeType ||
+                    'image/jpeg',
+
+                data:
+                    media.buffer.toString(
+                        'base64'
+                    )
+            }
+        });
+    }
+
+
+    let prompt =
+        String(
+            userText || ''
+        ).trim();
+
+
+    if (!prompt) {
+        prompt =
+            'Create a high quality image based on the provided image.';
+    }
+
+
+    currentParts.push({
+        text:
+            prompt
+    });
+
+
+    contents.push({
+        role: 'user',
+        parts: currentParts
+    });
+
+
+    const body = {
+        contents,
+
+        generationConfig: {
+            responseModalities: [
+                'IMAGE',
+                'TEXT'
+            ]
+        }
+    };
+
+
+    /*
+     * System prompt
+     */
+
+    if (systemPrompt) {
+        body.systemInstruction = {
+            parts: [
+                {
+                    text:
+                        String(
+                            systemPrompt
+                        )
+                }
+            ]
+        };
+    }
+
+
+    const response =
+        await axios.post(
+            `${AI_API_URL}/${encodeURIComponent(
+                IMAGE_MODEL
+            )}:generateContent`,
+            body,
+            {
+                headers: {
+                    'x-goog-api-key':
+                        apiKey,
+
+                    'Content-Type':
+                        'application/json'
+                },
+
+                timeout:
+                    180000,
+
+                maxContentLength:
+                    Infinity,
+
+                maxBodyLength:
+                    Infinity,
+
+                validateStatus:
+                    () => true
+            }
+        );
+
+
+    if (
+        response.status < 200 ||
+        response.status >= 300
+    ) {
+        const apiError =
+            response.data?.error;
+
+        const message =
+            apiError?.message ||
+            `Gemini image API returned HTTP ${response.status}`;
+
+        throw new Error(
+            message
+        );
+    }
+
+
+    const candidates =
+        response.data?.candidates ||
+        [];
+
+    const parts =
+        candidates?.[0]?.content?.parts ||
+        [];
+
+
+    let image = null;
+    let text = '';
+
+
+    for (
+        const part of parts
+    ) {
+        if (
+            part?.inlineData?.data
+        ) {
+            const mimeType =
+                part.inlineData.mimeType ||
+                'image/png';
+
+            if (
+                mimeType.startsWith(
+                    'image/'
+                )
+            ) {
+                image = {
+                    buffer:
+                        Buffer.from(
+                            part.inlineData.data,
+                            'base64'
+                        ),
+
+                    mimeType
+                };
+            }
+        }
+
+
+        if (
+            part?.text &&
+            !part?.thought
+        ) {
+            text +=
+                part.text;
+        }
+    }
+
+
+    if (!image) {
+        throw new Error(
+            'Gemini did not return a generated image.'
+        );
+    }
+
+
+    return {
+        text:
+            text.trim(),
+
+        image
+    };
+}
+
+
+/* =========================================================
+ * SEND TEXT REPLY
  * ========================================================= */
 
 async function sendReply(
@@ -424,7 +1164,7 @@ async function sendReply(
     const chunks = [];
 
     let remaining =
-        String(text);
+        String(text || '');
 
 
     while (
@@ -492,6 +1232,49 @@ async function sendReply(
 
 
 /* =========================================================
+ * SEND GENERATED IMAGE
+ * ========================================================= */
+
+async function sendGeneratedImage(
+    sock,
+    from,
+    image,
+    caption,
+    quoted
+) {
+    if (
+        !image?.buffer
+    ) {
+        return;
+    }
+
+
+    const message = {
+        image:
+            image.buffer
+    };
+
+
+    if (caption) {
+        message.caption =
+            caption.slice(
+                0,
+                1000
+            );
+    }
+
+
+    await sock.sendMessage(
+        from,
+        message,
+        {
+            quoted
+        }
+    );
+}
+
+
+/* =========================================================
  * IGNORE MESSAGE TYPES
  * ========================================================= */
 
@@ -548,7 +1331,62 @@ function queueChat(
 
 
 /* =========================================================
- * HANDLE MESSAGE
+ * MEDIA HISTORY TEXT
+ * ========================================================= */
+
+function getHistoryUserText(
+    text,
+    media
+) {
+    const clean =
+        String(
+            text || ''
+        ).trim();
+
+
+    if (clean) {
+        if (media?.type) {
+            return (
+                `[User sent ${media.type}]\n` +
+                clean
+            );
+        }
+
+        return clean;
+    }
+
+
+    if (
+        media?.type === 'image'
+    ) {
+        return (
+            '[User sent an image and asked the AI to analyze it.]'
+        );
+    }
+
+    if (
+        media?.type === 'video'
+    ) {
+        return (
+            '[User sent a video and asked the AI to analyze it.]'
+        );
+    }
+
+    if (
+        media?.type === 'audio'
+    ) {
+        return (
+            '[User sent an audio message and asked the AI to understand it.]'
+        );
+    }
+
+
+    return '';
+}
+
+
+/* =========================================================
+ * HANDLE INCOMING MESSAGE
  * ========================================================= */
 
 async function handleIncomingMessage(
@@ -573,15 +1411,25 @@ async function handleIncomingMessage(
     const text =
         getText(msg);
 
+    const mediaInfo =
+        getMediaInfo(msg);
 
-    if (!text) {
+
+    /*
+     * Ignore completely unsupported messages.
+     */
+
+    if (
+        !text &&
+        !mediaInfo
+    ) {
         return;
     }
 
 
     /*
-     * Dot commands are handled
-     * by the command system.
+     * Dot commands are handled by the
+     * command system.
      */
 
     if (
@@ -654,68 +1502,199 @@ async function handleIncomingMessage(
                     );
 
 
-                const answer =
-                    await askAI({
-                        apiKey,
+                /*
+                 * Download media if present.
+                 */
 
-                        model:
-                            chat.model,
+                let media = null;
 
-                        systemPrompt:
-                            chat.systemPrompt,
 
-                        history:
-                            chat.memory
-                                ? chat.history
-                                : [],
+                if (mediaInfo) {
+                    const buffer =
+                        await downloadWhatsAppMedia(
+                            sock,
+                            msg
+                        );
 
-                        userText
-                    });
+
+                    validateMediaSize(
+                        buffer,
+                        mediaInfo
+                    );
+
+
+                    media = {
+                        type:
+                            mediaInfo.type,
+
+                        mimeType:
+                            mediaInfo.mimeType,
+
+                        buffer
+                    };
+                }
 
 
                 /*
-                 * Save history
+                 * Image generation / editing
+                 */
+
+                const shouldGenerateImage =
+                    isImageGenerationRequest(
+                        userText,
+                        media?.type ===
+                            'image'
+                    );
+
+
+                let result;
+
+
+                if (
+                    shouldGenerateImage
+                ) {
+                    result =
+                        await generateImage({
+                            apiKey,
+
+                            systemPrompt:
+                                chat.systemPrompt,
+
+                            history:
+                                chat.memory
+                                    ? chat.history
+                                    : [],
+
+                            userText,
+
+                            media
+                        });
+
+                } else {
+                    result =
+                        await askAI({
+                            apiKey,
+
+                            model:
+                                chat.model,
+
+                            systemPrompt:
+                                chat.systemPrompt,
+
+                            history:
+                                chat.memory
+                                    ? chat.history
+                                    : [],
+
+                            userText,
+
+                            media
+                        });
+                }
+
+
+                /*
+                 * Save conversation history.
                  */
 
                 if (
                     chat.memory
                 ) {
-                    chat.history = [
-                        ...chat.history,
+                    const historyUserText =
+                        getHistoryUserText(
+                            userText,
+                            media
+                        );
 
-                        {
-                            role:
-                                'user',
 
-                            text:
-                                userText
-                        },
+                    if (
+                        historyUserText
+                    ) {
+                        const historyItems = [
+                            {
+                                role:
+                                    'user',
 
-                        {
-                            role:
-                                'assistant',
+                                text:
+                                    historyUserText
+                            }
+                        ];
 
-                            text:
-                                answer
+
+                        if (
+                            result.text
+                        ) {
+                            historyItems.push({
+                                role:
+                                    'assistant',
+
+                                text:
+                                    result.text
+                            });
+                        } else if (
+                            result.image
+                        ) {
+                            historyItems.push({
+                                role:
+                                    'assistant',
+
+                                text:
+                                    '[AI generated an image.]'
+                            });
                         }
-                    ].slice(
-                        -MAX_HISTORY_MESSAGES
-                    );
 
 
-                    await saveChat(
-                        sessionId,
-                        from
-                    );
+                        chat.history = [
+                            ...chat.history,
+                            ...historyItems
+                        ].slice(
+                            -MAX_HISTORY_MESSAGES
+                        );
+
+
+                        await saveChat(
+                            sessionId,
+                            from
+                        );
+                    }
                 }
 
 
-                await sendReply(
-                    sock,
-                    from,
-                    answer,
-                    msg
-                );
+                /*
+                 * If Gemini generated an image,
+                 * send it first.
+                 */
+
+                if (
+                    result.image
+                ) {
+                    await sendGeneratedImage(
+                        sock,
+                        from,
+                        result.image,
+                        result.text,
+                        msg
+                    );
+
+
+                    return;
+                }
+
+
+                /*
+                 * Normal text response.
+                 */
+
+                if (
+                    result.text
+                ) {
+                    await sendReply(
+                        sock,
+                        from,
+                        result.text,
+                        msg
+                    );
+                }
 
             } catch (err) {
                 console.error(
@@ -724,14 +1703,32 @@ async function handleIncomingMessage(
                 );
 
 
+                let errorText =
+                    err?.message ||
+                    'Unable to generate a response.';
+
+
+                /*
+                 * Keep API error messages useful
+                 * but don't expose giant JSON payloads.
+                 */
+
+                if (
+                    errorText.length > 1200
+                ) {
+                    errorText =
+                        errorText.slice(
+                            0,
+                            1200
+                        );
+                }
+
+
                 await sock.sendMessage(
                     from,
                     {
                         text:
-                            `❌ Gemini AI error: ${
-                                err.message ||
-                                'Unable to generate a response.'
-                            }`
+                            `❌ Gemini AI error:\n${errorText}`
                     },
                     {
                         quoted:
@@ -805,11 +1802,6 @@ function attachSocket(
     sock.ev.on(
         'messages.upsert',
         event => {
-
-            /*
-             * Restore bot session context
-             */
-
             runWithSession(
                 sessionId,
                 async () => {
@@ -938,7 +1930,9 @@ function usage(chat) {
                 : 'OFF ❌'
         }*\n` +
 
-        `Model: \`${chat.model}\`\n\n` +
+        `Model: \`${chat.model}\`\n` +
+
+        `Image Model: \`${IMAGE_MODEL}\`\n\n` +
 
         '`.aimode on` — AI ON for this chat\n' +
 
@@ -954,7 +1948,9 @@ function usage(chat) {
 
         '`.aisystem reset` — reset system prompt\n' +
 
-        '`.aistatus` — show status'
+        '`.aistatus` — show status\n\n' +
+
+        '🖼️ Images • 🎥 Videos • 🎤 Voice • 🎨 Image generation supported'
     );
 }
 
@@ -976,7 +1972,7 @@ export default {
 
     category: 'ai',
 
-    desc: 'Gemini AI conversation mode',
+    desc: 'Gemini AI multimodal conversation mode',
 
     function: async (
         sock,
@@ -1064,7 +2060,7 @@ export default {
                         text:
                             chat.enabled
 
-                                ? '🤖 *AI MODE ON* ✅\n\nදැන් මේ chat එකේ සාමාන්‍ය messages Gemini AI conversation එකට යනවා.\n\n`.aimode off` දාලා normal mode එකට යන්න.'
+                                ? '🤖 *AI MODE ON* ✅\n\nදැන් මේ chat එකේ text, images, videos සහ voice messages Gemini AI conversation එකට යනවා.\n\n🎨 Image generate/edit requests වලට image reply එකකුත් එනවා.\n\n`.aimode off` දාලා normal mode එකට යන්න.'
 
                                 : '🤖 *AI MODE OFF* ❌\n\nමේ chat එකේ Gemini AI conversation mode එක off කළා.'
                     },
@@ -1152,14 +2148,12 @@ export default {
             if (
                 !chat.memory
             ) {
-
                 await clearChatHistory(
                     sessionId,
                     from
                 );
 
             } else {
-
                 await saveChat(
                     sessionId,
                     from
@@ -1204,7 +2198,7 @@ export default {
                     from,
                     {
                         text:
-                            `🤖 Current model: \`${chat.model}\``
+                            `🤖 Current model: \`${chat.model}\`\n🎨 Image model: \`${IMAGE_MODEL}\``
                     },
                     {
                         quoted:
